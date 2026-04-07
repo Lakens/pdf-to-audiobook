@@ -1,0 +1,149 @@
+# PDF to Audiobook
+
+Convert any PDF (academic book, paper, report) to an MP3 audiobook using local AI for text extraction and free cloud TTS for audio synthesis.
+
+## How it works
+
+```
+PDF → [GLM-OCR / marker / PyPDF2] → cleaned text → [Edge TTS] → MP3
+```
+
+### Step 1 — Text extraction
+
+Three methods are tried in order (auto mode):
+
+1. **GLM-OCR** (default) — A 0.9B vision model running locally via [Ollama](https://ollama.com). Renders each PDF page as an image and reads it with AI. Handles complex layouts, footnotes, and figures. Uses your GPU if available.
+2. **marker** — A heavier ML pipeline (layout detection + optional OCR). Also GPU-accelerated. Falls back to this if GLM-OCR is unavailable.
+3. **PyPDF2** — Simple text extraction. Fast but loses structure; last resort.
+
+### Step 2 — Text cleaning
+
+Before synthesis, the extracted text is cleaned:
+- Markdown headers (`##`, `###`) are stripped
+- Symbols TTS reads awkwardly are removed: `^`, `~`, `|`, `\`
+- Subscript/superscript notation (`H_2_O`, `^13^C`) is cleaned up
+- Markdown links, bold/italic markers, inline code are removed
+
+### Step 3 — Text-to-speech
+
+Uses [Edge TTS](https://github.com/rany2/edge-tts) — Microsoft's neural TTS, free and requires no API key. Long texts are automatically split into chunks and joined into a single MP3.
+
+---
+
+## Requirements
+
+### Core (required)
+```
+pip install edge-tts pymupdf
+```
+
+### GLM-OCR (recommended — best quality)
+1. Install [Ollama](https://ollama.com/download)
+2. Pull the model:
+   ```
+   ollama pull glm-ocr
+   ```
+3. Install the Python client:
+   ```
+   pip install ollama
+   ```
+   Ollama must be running before you start (`ollama serve` or the desktop app).
+
+### marker (optional — alternative to GLM-OCR)
+```
+pip install marker-pdf torch
+```
+GPU (CUDA) is strongly recommended; CPU extraction is very slow for long books.
+
+### ffmpeg (optional — for cleaner MP3 joining)
+Download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH.
+Without ffmpeg, chunks are joined via raw binary concatenation (usually fine).
+
+---
+
+## Usage
+
+### Standalone script
+
+```bash
+# Basic — uses auto extraction (GLM-OCR preferred)
+py -3 pdf_to_audiobook.py "path/to/Chang - 2012 - Is Water H2O.pdf"
+
+# Specify output folder
+py -3 pdf_to_audiobook.py book.pdf --output C:/Audiobooks/Chang
+
+# Force a specific extraction method
+py -3 pdf_to_audiobook.py book.pdf --extraction marker
+py -3 pdf_to_audiobook.py book.pdf --extraction glm-ocr
+py -3 pdf_to_audiobook.py book.pdf --extraction pypdf
+
+# Change TTS voice
+py -3 pdf_to_audiobook.py book.pdf --voice en-GB-SoniaNeural
+```
+
+Output is placed in a folder named after the PDF (next to it), or in `--output`:
+```
+Chang - 2012 - Is Water H2O/
+  Chang - 2012 - Is Water H2O.mp3         ← audiobook
+  Chang - 2012 - Is Water H2O_timing.json ← word-level timestamps
+  Chang - 2012 - Is Water H2O_text.md     ← extracted text (for inspection)
+```
+
+The timing file maps every word to its position in the audio:
+```json
+[
+  {"word": "Is", "start_sec": 0.0},
+  {"word": "Water", "start_sec": 0.375},
+  {"word": "H2O", "start_sec": 0.812},
+  ...
+]
+```
+This enables building a read-along player, chapter navigation, or searching for a passage and jumping directly to that point in the audio.
+
+### Obsidian integration
+
+The Obsidian version (`pdf_to_speech.py`) integrates with your vault:
+- Reads the selected PDF from a side-channel file (`pdf_to_convert_pending.txt`)
+- Creates an Obsidian note with an embedded audio player, progress tracker, and timestamp button
+- Archives the PDF after processing
+- Triggered via a DataviewJS button in your home note
+
+Both scripts share the same extraction chain and cleaning logic.
+
+---
+
+## Available voices
+
+Some good Edge TTS voices:
+
+| Voice | Description |
+|---|---|
+| `en-US-AriaNeural` | US English, female (default) |
+| `en-US-GuyNeural` | US English, male |
+| `en-GB-SoniaNeural` | British English, female |
+| `en-GB-RyanNeural` | British English, male |
+| `en-AU-NatashaNeural` | Australian English, female |
+
+List all available voices:
+```bash
+py -3 -m edge_tts --list-voices
+```
+
+---
+
+## Performance notes
+
+- **GLM-OCR on GPU**: ~5–10 pages/minute (RTX A1000 6GB). A 334-page book takes ~50 min.
+- **GLM-OCR on CPU**: much slower, not recommended for books.
+- **marker on GPU** (OCR disabled): ~3 pages/sec for layout, then fast text extraction.
+- **TTS**: ~1–2 minutes per 50,000 characters via Edge TTS.
+
+For a full academic book (~330 pages), expect 1–2 hours total.
+
+---
+
+## Tips
+
+- If Ollama is not running, GLM-OCR will fail and the script falls back to marker, then PyPDF2.
+- The extracted text is always saved separately so you can inspect quality before committing to TTS.
+- For very large books, Edge TTS occasionally drops a chunk (`NoAudioReceived`). Re-running the script will redo only the failed run.
