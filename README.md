@@ -67,34 +67,34 @@ Without ffmpeg, chunks are joined via raw binary concatenation (usually fine).
 
 ```bash
 # Basic — uses auto extraction (GLM-OCR preferred)
-py -3 pdf_to_audiobook.py "path/to/Chang - 2012 - Is Water H2O.pdf"
+py -3 pdf_to_audiobook.py "path/to/my_paper.pdf"
 
 # Specify output folder
-py -3 pdf_to_audiobook.py book.pdf --output C:/Audiobooks/Chang
+py -3 pdf_to_audiobook.py my_paper.pdf --output C:/Audiobooks/my_paper
 
 # Force a specific extraction method
-py -3 pdf_to_audiobook.py book.pdf --extraction marker
-py -3 pdf_to_audiobook.py book.pdf --extraction glm-ocr
-py -3 pdf_to_audiobook.py book.pdf --extraction pypdf
+py -3 pdf_to_audiobook.py my_paper.pdf --extraction marker
+py -3 pdf_to_audiobook.py my_paper.pdf --extraction glm-ocr
+py -3 pdf_to_audiobook.py my_paper.pdf --extraction pypdf
 
 # Change TTS voice
-py -3 pdf_to_audiobook.py book.pdf --voice en-GB-SoniaNeural
+py -3 pdf_to_audiobook.py my_paper.pdf --voice en-GB-SoniaNeural
 ```
 
 Output is placed in a folder named after the PDF (next to it), or in `--output`:
 ```
-Chang - 2012 - Is Water H2O/
-  Chang - 2012 - Is Water H2O.mp3         ← audiobook
-  Chang - 2012 - Is Water H2O_timing.json ← word-level timestamps
-  Chang - 2012 - Is Water H2O_text.md     ← extracted text (for inspection)
+my_paper/
+  my_paper.mp3         ← audiobook
+  my_paper_timing.json ← word-level timestamps
+  my_paper_text.md     ← extracted text (for inspection)
 ```
 
 The timing file maps every word to its position in the audio:
 ```json
 [
-  {"word": "Is", "start_sec": 0.0},
-  {"word": "Water", "start_sec": 0.375},
-  {"word": "H2O", "start_sec": 0.812},
+  {"word": "Introduction", "start_sec": 0.0},
+  {"word": "This", "start_sec": 0.612},
+  {"word": "paper", "start_sec": 0.875},
   ...
 ]
 ```
