@@ -1,0 +1,1316 @@
+#!/usr/bin/env python3
+"""
+PDF to Speech Converter for Obsidian
+Extracts text from PDFs and converts to audio files.
+Generates notes in the same style as YouTube/podcast notes, with audio player,
+timestamp button, and transcribe button.
+
+Usage:
+    py -3 pdf_to_speech.py --vault "C:\\path\\to\\vault" --note "C:\\...\\01 - Home_Audio_Video.md"
+    py -3 pdf_to_speech.py --vault "..." --note "..." --pdf "filename.pdf"
+    py -3 pdf_to_speech.py --vault "..." --note "..." --tts coqui
+
+The script reads the selected PDF filename from
+  <vault>/99 - System/pdf_to_convert_pending.txt
+unless --pdf is passed directly.
+"""
+
+import os
+import sys
+import re
+import json
+import argparse
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Tuple
+import subprocess
+
+# Try to import optional dependencies
+try:
+    import requests
+except ImportError:
+    requests = None
+
+try:
+    import PyPDF2
+except ImportError:
+    PyPDF2 = None
+
+
+# ---------------------------------------------------------------------------
+# DataviewJS blocks — identical to those in download_youtube.py
+# ---------------------------------------------------------------------------
+
+AUDIO_PLAYER = r"""```dataviewjs
+(async () => {
+    const fm = dv.current();
+    const audioFile = fm.audio_file;
+    const mediaFolder = fm.media_folder;
+    if (!audioFile || !mediaFolder) {
+        dv.el("p", "No audio_file / media_folder in frontmatter.");
+        return;
+    }
+    const obsFile = app.vault.getAbstractFileByPath(mediaFolder + "/" + audioFile);
+    if (!obsFile) {
+        dv.el("p", "Audio file not found in vault: " + audioFile);
+        return;
+    }
+    const src = app.vault.getResourcePath(obsFile);
+    const C = this.container;
+
+    const style = C.createEl("style");
+    style.textContent = `
+        .cp { font-family: sans-serif; max-width: 520px; padding: 10px 0; user-select: none; }
+        .cp-top { display:flex; align-items:center; justify-content:center; gap:24px; margin-bottom:10px; }
+        .cp-play { font-size:2.8em; width:1.4em; height:1.4em; background:none; border:none;
+                   cursor:pointer; line-height:1; display:flex; align-items:center; justify-content:center; }
+        .cp-skip { font-size:0.9em; background:none; border:none; cursor:pointer;
+                   display:flex; flex-direction:column; align-items:center; gap:1px;
+                   color: var(--text-normal); }
+        .cp-skip .cp-skip-icon { font-size:2.5em; line-height:1; }
+        .cp-skip .cp-skip-lbl { font-size:0.7em; opacity:0.7; }
+        .cp-timeline { display:flex; align-items:center; gap:8px; margin-bottom:10px;
+                       font-size:0.82em; color:var(--text-muted); }
+        .cp-seek { flex:1; height:4px; cursor:pointer; accent-color:var(--interactive-accent); }
+        .cp-extras { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:0.82em; }
+        .cp-spd { background:none; border:1px solid var(--background-modifier-border);
+                  border-radius:4px; padding:2px 7px; cursor:pointer; font-size:0.82em;
+                  color:var(--text-normal); }
+        .cp-spd.on { background:var(--interactive-accent); color:#fff;
+                     border-color:var(--interactive-accent); }
+        .cp-vol { width:70px; accent-color:var(--interactive-accent); }
+    `;
+
+    const wrap = C.createEl("div", { cls: "cp" });
+    const audio = wrap.createEl("audio");
+    audio.src = src;
+    audio.style.display = "none";
+
+    // — top row —
+    const top = wrap.createEl("div", { cls: "cp-top" });
+
+    const rwBtn = top.createEl("button", { cls: "cp-skip", title: "Rewind 30 s" });
+    rwBtn.createEl("span", { cls: "cp-skip-icon", text: "⏪" });
+    rwBtn.createEl("span", { cls: "cp-skip-lbl",  text: "30 s" });
+
+    const playBtn = top.createEl("button", { cls: "cp-play", text: "▶" });
+
+    const fwBtn = top.createEl("button", { cls: "cp-skip", title: "Forward 30 s" });
+    fwBtn.createEl("span", { cls: "cp-skip-icon", text: "⏩" });
+    fwBtn.createEl("span", { cls: "cp-skip-lbl",  text: "30 s" });
+
+    // — timeline —
+    const tl = wrap.createEl("div", { cls: "cp-timeline" });
+    const cur = tl.createEl("span", { text: "0:00" });
+    const seek = tl.createEl("input", { attr: { type:"range", min:0, max:100, value:0, step:0.05 } });
+    seek.classList.add("cp-seek");
+    const dur = tl.createEl("span", { text: "0:00" });
+
+    // — extras —
+    const ext = wrap.createEl("div", { cls: "cp-extras" });
+    const speeds = [0.5, 0.75, 1, 1.25, 1.5, 2];
+    const spdBtns = speeds.map(sp => {
+        const b = ext.createEl("button", { cls: "cp-spd" + (sp === 1 ? " on" : ""), text: sp + "x" });
+        b.addEventListener("click", () => {
+            audio.playbackRate = sp;
+            spdBtns.forEach(x => x.classList.remove("on"));
+            b.classList.add("on");
+        });
+        return b;
+    });
+    ext.createEl("span", { text: "🔊", attr: { style: "margin-left:8px;" } });
+    const vol = ext.createEl("input", { attr: { type:"range", min:0, max:1, step:0.05, value:1 } });
+    vol.classList.add("cp-vol");
+
+    // — helpers —
+    const fmt = s => {
+        const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sc = Math.floor(s%60);
+        return h > 0 ? `${h}:${String(m).padStart(2,"0")}:${String(sc).padStart(2,"0")}`
+                     : `${m}:${String(sc).padStart(2,"0")}`;
+    };
+
+    // — events —
+    playBtn.addEventListener("click", () => audio.paused ? audio.play() : audio.pause());
+    audio.addEventListener("play",  () => { playBtn.textContent = "⏸"; });
+    audio.addEventListener("pause", () => { playBtn.textContent = "▶"; });
+    audio.addEventListener("ended", () => { playBtn.textContent = "▶"; });
+    rwBtn.addEventListener("click", () => { audio.currentTime = Math.max(0, audio.currentTime - 30); });
+    fwBtn.addEventListener("click", () => { audio.currentTime = Math.min(audio.duration || 0, audio.currentTime + 30); });
+    audio.addEventListener("timeupdate", () => {
+        cur.textContent = fmt(audio.currentTime);
+        if (audio.duration) seek.value = (audio.currentTime / audio.duration) * 100;
+    });
+    audio.addEventListener("loadedmetadata", async () => {
+        dur.textContent = fmt(audio.duration);
+
+        // Restore saved playback position
+        try {
+            const raw = await app.vault.adapter.read("99 - System/playback_positions.json");
+            const positions = JSON.parse(raw);
+            const saved = positions[app.workspace.getActiveFile()?.path];
+            if (saved && saved > 2 && saved < audio.duration - 30) {
+                audio.currentTime = saved;
+            }
+        } catch(e) {}
+    });
+    audio.addEventListener("pause", async () => {
+        if (audio.currentTime < 2) return;
+        try {
+            const activeFile = app.workspace.getActiveFile();
+            if (!activeFile) return;
+            let positions = {};
+            try {
+                const raw = await app.vault.adapter.read("99 - System/playback_positions.json");
+                positions = JSON.parse(raw);
+            } catch(e) {}
+            positions[activeFile.path] = Math.floor(audio.currentTime);
+            await app.vault.adapter.write("99 - System/playback_positions.json", JSON.stringify(positions, null, 2));
+        } catch(e) {}
+    });
+    seek.addEventListener("input", () => {
+        if (audio.duration) audio.currentTime = (parseFloat(seek.value) / 100) * audio.duration;
+    });
+    vol.addEventListener("input", () => { audio.volume = parseFloat(vol.value); });
+
+    // Save position every 5 s while playing — guards against navigation without pause
+    const savePosition = async () => {
+        if (audio.paused || audio.currentTime < 2) return;
+        try {
+            const activeFile = app.workspace.getActiveFile();
+            if (!activeFile) return;
+            let positions = {};
+            try {
+                const raw = await app.vault.adapter.read("99 - System/playback_positions.json");
+                positions = JSON.parse(raw);
+            } catch(e) {}
+            positions[activeFile.path] = Math.floor(audio.currentTime);
+            await app.vault.adapter.write("99 - System/playback_positions.json", JSON.stringify(positions, null, 2));
+        } catch(e) {}
+    };
+    const _interval = setInterval(savePosition, 5000);
+    // Clean up interval when the player is removed from the DOM
+    new MutationObserver(() => {
+        if (!wrap.isConnected) clearInterval(_interval);
+    }).observe(wrap.parentElement || C, { childList: true, subtree: true });
+})();
+```"""
+
+
+TIMESTAMP_BUTTON = r"""```dataviewjs
+(async () => {
+    const LOG = "99 - System/timestamp_log.json";
+    const file = app.workspace.getActiveFile();
+    if (!file) return;
+
+    if (window._cpWriting) return;
+
+    const C = this.container;
+    const btn = C.createEl("button", {
+        text: "⏱ Mark timestamp",
+        attr: { style: "padding:5px 16px; cursor:pointer; font-size:0.95em;" }
+    });
+    const status = C.createEl("span", {
+        attr: { style: "font-size:0.82em; color:var(--text-muted); margin-left:10px;" }
+    });
+
+    const fmt = t => {
+        const h = Math.floor(t/3600), m = Math.floor((t%3600)/60), s = Math.floor(t%60);
+        return h > 0 ? `${h}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`
+                     : `${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+    };
+
+    btn.addEventListener("click", async () => {
+        if (window._cpWriting) return;
+        const all = [...document.querySelectorAll("audio,video")];
+        const media = all.find(m => !m.paused) ?? all.find(m => m.currentTime > 0) ?? all[0];
+        if (!media) { new Notice("No audio or video found in this note."); return; }
+        const t = media.currentTime;
+        if (t === 0) { new Notice("Audio is at 0:00 — play or seek first."); return; }
+
+        const ts = fmt(t);
+        window._cpWriting = true;
+        try {
+            let entries = [];
+            try {
+                const raw = await app.vault.adapter.read(LOG);
+                entries = JSON.parse(raw);
+            } catch(e) { entries = []; }
+
+            entries.push({
+                note_path: file.path,
+                note_title: app.metadataCache.getFileCache(file)?.frontmatter?.title || file.basename,
+                timestamp: ts,
+                seconds: Math.floor(t),
+                logged_at: new Date().toISOString(),
+                processed: false
+            });
+
+            await app.vault.adapter.write(LOG, JSON.stringify(entries, null, 2));
+            status.textContent = `✓ ${ts}`;
+            setTimeout(() => { status.textContent = ""; }, 2500);
+            new Notice(`⏱ Logged: ${ts}`);
+        } catch(e) {
+            new Notice("Error writing timestamp log: " + e.message);
+        } finally {
+            window._cpWriting = false;
+        }
+    });
+})();
+```"""
+
+
+TRANSCRIBE_BUTTON = r"""```dataviewjs
+(async () => {
+    const PENDING = "99 - System/transcribe_pending.txt";
+    const MONITOR = "99 - System/transcribe_monitor";
+    const file = app.workspace.getActiveFile();
+    if (!file) return;
+    const C = this.container;
+    const btn = C.createEl("button", {
+        text: "🎙 Transcribe with Whisper",
+        attr: { style: "padding:5px 16px; cursor:pointer; font-size:0.95em;" }
+    });
+    btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        btn.textContent = "⏳ Starting…";
+        await app.vault.adapter.write(PENDING, file.path);
+        window.open("obsidian://shell-commands?vault=obsidian&execute=transcribe-audio");
+        setTimeout(() => {
+            app.workspace.openLinkText(MONITOR, "", true);
+        }, 800);
+        setTimeout(() => { btn.disabled = false; btn.textContent = "🎙 Transcribe with Whisper"; }, 4000);
+    });
+})();
+```"""
+
+
+# ---------------------------------------------------------------------------
+# Progress reporter — writes directly to a vault file so Obsidian can read it
+# ---------------------------------------------------------------------------
+
+class Progress:
+    """Writes live progress to a markdown file inside the vault."""
+
+    STEPS = [
+        "Extracting text from PDF",
+        "Preparing text for TTS",
+        "Converting text to speech",
+        "Creating Obsidian note",
+    ]
+
+    def __init__(self, vault: Path, pdf_name: str):
+        self.path = vault / "99 - System" / "pdf_convert_progress.md"
+        self.pdf_name = pdf_name
+        self.current_step = 0
+        self.total_steps = len(self.STEPS)
+        self._write("Starting...")
+
+    def step(self, n: int, detail: str = ""):
+        """Mark step n (1-based) as in progress."""
+        self.current_step = n
+        bar = self._bar(n - 1, self.total_steps)
+        lines = [
+            f"**Converting:** {self.pdf_name}",
+            f"",
+            f"{bar}  Step {n}/{self.total_steps}",
+            f"",
+            f"**{self.STEPS[n-1]}**" + (f" — {detail}" if detail else ""),
+        ]
+        self._write("\n".join(lines))
+
+    def done(self, note_name: str, elapsed: float):
+        bar = self._bar(self.total_steps, self.total_steps)
+        lines = [
+            f"**Done:** {self.pdf_name}",
+            f"",
+            f"{bar}  Complete ({elapsed:.0f}s)",
+            f"",
+            f"Note created: [[{note_name}]]",
+        ]
+        self._write("\n".join(lines))
+
+    def error(self, step_name: str, msg: str):
+        lines = [
+            f"**FAILED** at: {step_name}",
+            f"",
+            f"Error: {msg}",
+        ]
+        self._write("\n".join(lines))
+
+    def _bar(self, done: int, total: int) -> str:
+        filled = round(done / total * 20)
+        return "[" + "#" * filled + "-" * (20 - filled) + "]"
+
+    def _write(self, text: str):
+        try:
+            self.path.write_text(text + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Text helpers
+# ---------------------------------------------------------------------------
+
+def strip_markdown_headers(text: str) -> str:
+    """Replace markdown header markers with plain text so TTS doesn't read '##'."""
+    # Remove heading markers at line starts and residual inline heading markers.
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'(?<!\w)#{1,6}\s+(?=[A-Za-z0-9])', '', text)
+    return text
+
+
+def join_paragraphs_for_tts(text: str) -> str:
+    """Join paragraph fragments with minimal punctuation for smoother speech."""
+    paragraphs = [p.strip() for p in re.split(r'\n{2,}', text) if p.strip()]
+    if not paragraphs:
+        return ""
+
+    merged = [paragraphs[0]]
+    for para in paragraphs[1:]:
+        prev = merged[-1]
+        # Keep a soft join when prior chunk already ends as a sentence.
+        if re.search(r'[.!?]["\'\)\]]?\s*$', prev):
+            merged.append(para)
+        else:
+            merged[-1] = prev.rstrip() + "."
+            merged.append(para)
+
+    return " ".join(merged)
+
+
+def remove_non_speech_sections(text: str) -> str:
+    """Drop references and non-prose blocks that hurt audiobook flow."""
+    lines = text.splitlines()
+    stop_headings = {
+        "references",
+        "bibliography",
+        "works cited",
+        "literature cited",
+    }
+
+    cutoff = len(lines)
+    for idx, line in enumerate(lines):
+        heading = re.sub(r'^\s*#{0,6}\s*', '', line).strip().lower()
+        heading = re.sub(r'\s*[:\-]+\s*$', '', heading)
+        if heading in stop_headings:
+            cutoff = idx
+            break
+
+    filtered = []
+    for line in lines[:cutoff]:
+        s = line.strip()
+        if not s:
+            filtered.append("")
+            continue
+
+        if re.match(r'!\[[^\]]*\]\([^\)]+\)$', s):
+            continue
+        if re.match(r'^\|.*\|$', s):
+            continue
+        if re.match(r'^(?:https?://|doi\.org/|doi:\s*)', s, flags=re.IGNORECASE):
+            continue
+        if re.match(r'^(?:figure|fig\.?|table)\s*\d+[A-Za-z]?(?:\.\d+)?\s*[:\.\-)\s]', s, flags=re.IGNORECASE):
+            continue
+
+        filtered.append(line)
+
+    return "\n".join(filtered)
+
+
+def normalize_formula_text(text: str) -> str:
+    """Convert common formula notation into speech-friendly plain text."""
+    replacements = {
+        "≤": " less than or equal to ",
+        "≥": " greater than or equal to ",
+        "≠": " not equal to ",
+        "≈": " approximately ",
+        "±": " plus or minus ",
+        "α": " alpha ",
+        "β": " beta ",
+        "γ": " gamma ",
+        "δ": " delta ",
+        "μ": " mu ",
+        "σ": " sigma ",
+        "λ": " lambda ",
+        "θ": " theta ",
+        "π": " pi ",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+
+    # Common p-value notation
+    text = re.sub(r'\bp\s*(?:<=|=<)\s*\.?([0-9]+)\b', r'p less than or equal to 0.\1', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bp\s*(?:>=|=>)\s*\.?([0-9]+)\b', r'p greater than or equal to 0.\1', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bp\s*<\s*\.?([0-9]+)\b', r'p less than 0.\1', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bp\s*>\s*\.?([0-9]+)\b', r'p greater than 0.\1', text, flags=re.IGNORECASE)
+
+    def _latex_to_speech(expr: str) -> str:
+        expr = re.sub(r'\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}', r' \1 over \2 ', expr)
+        expr = re.sub(r'\\(alpha|beta|gamma|delta|mu|sigma|lambda|theta|pi)\b', r' \1 ', expr)
+        expr = re.sub(r'\\(leq|le)\b', ' less than or equal to ', expr)
+        expr = re.sub(r'\\(geq|ge)\b', ' greater than or equal to ', expr)
+        expr = re.sub(r'\\neq\b', ' not equal to ', expr)
+        expr = re.sub(r'\\approx\b', ' approximately ', expr)
+        expr = re.sub(r'\\pm\b', ' plus or minus ', expr)
+        expr = re.sub(r'\\times\b', ' times ', expr)
+        expr = re.sub(r'\\mid\b', ' given ', expr)
+        expr = re.sub(r'[_^]\{?([^{}\s]+)\}?', r' \1 ', expr)
+        expr = re.sub(r'\\[A-Za-z]+', ' ', expr)
+        expr = re.sub(r'[{}]', ' ', expr)
+        expr = re.sub(r'\s+', ' ', expr).strip()
+        return expr
+
+    text = re.sub(r'\$\$(.*?)\$\$', lambda m: f" {_latex_to_speech(m.group(1))} ", text, flags=re.DOTALL)
+    text = re.sub(r'\$([^$\n]+?)\$', lambda m: f" {_latex_to_speech(m.group(1))} ", text)
+
+    return text
+
+
+def compress_in_text_citations(text: str) -> str:
+    """Shorten in-line citation noise while preserving sentence flow."""
+    def _paren_repl(match: re.Match) -> str:
+        body = match.group(1)
+        has_year = re.search(r'\b\d{4}[a-z]?\b', body) is not None
+        looks_citation = has_year and (
+            ';' in body
+            or '&' in body
+            or 'et al' in body.lower()
+            or re.search(r'\b[A-Z][A-Za-z\-\'\.]+\s*,\s*\d{4}', body) is not None
+        )
+        if looks_citation:
+            return ' (citation) '
+        return match.group(0)
+
+    text = re.sub(r'\(([^()]{3,220})\)', _paren_repl, text)
+    text = re.sub(r'\[(?:\d{1,3}\s*(?:,|;)?\s*){1,8}\]', ' [citation] ', text)
+    return text
+
+
+def clean_text_for_tts(text: str, max_chars: int = 5_000_000) -> str:
+    """Strip markdown and scientific notation symbols unsuitable for TTS."""
+    # Fix 6: Hyphenated line-break artifacts (e.g. "eigh-\nteenth") before any whitespace collapse
+    text = re.sub(r'-\s*\n\s*', '', text)
+    # Remove markdown heading markers early so section detection sees plain headings.
+    text = strip_markdown_headers(text)
+    # Remove references and figure/table-heavy lines before joining paragraphs.
+    text = remove_non_speech_sections(text)
+    # Join paragraph fragments with fewer forced pauses.
+    text = join_paragraphs_for_tts(text)
+    # Convert formulas and symbols to speech-friendly text.
+    text = normalize_formula_text(text)
+    # Remove markdown formatting symbols
+    text = re.sub(r'\*{1,3}', '', text)          # bold/italic asterisks
+    text = re.sub(r'_{1,2}([^_]+)_{1,2}', r'\1', text)  # _subscript_ or __text__
+    text = re.sub(r'\^([^\s^]+)\^?', '', text)   # ^superscript^
+    text = re.sub(r'`[^`]*`', '', text)           # inline code
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)  # [label](url) -> label
+    text = re.sub(r'!\[[^\]]*\]\([^\)]+\)', '', text)      # ![image](url) -> removed
+    # Fix 1: Square brackets (editorial insertions, e.g. [sic], [the]) -> keep inner text
+    text = re.sub(r'\[([^\]]+)\]', r'\1', text)
+    # Fix 3: Curly braces (LaTeX/OCR artifacts) -> keep inner text
+    text = re.sub(r'\{([^}]+)\}', r'\1', text)
+    # Lone dollar signs
+    text = re.sub(r'\$', '', text)
+    # Fix 2: p. / pp. -> page / pages
+    text = re.sub(r'\bpp\.\s*(\d)', r'pages \1', text)
+    text = re.sub(r'\bp\.\s*(\d)', r'page \1', text)
+    # Fix 5: ALL CAPS words (headings) -> title case
+    text = re.sub(r'\b([A-Z]{2,})(?:\s+[A-Z]{2,})*\b', lambda m: m.group(0).title(), text)
+    # Compress citation parentheticals to reduce speech interruptions.
+    text = compress_in_text_citations(text)
+    # Normalize repeated punctuation artifacts that create unnatural pauses.
+    text = re.sub(r'(?:\s*\.\s*){3,}', '... ', text)
+    text = re.sub(r'\.{4,}', '... ', text)
+    # Remove lone special characters that TTS reads aloud awkwardly
+    text = re.sub(r'(?<!\w)[~^|\\](?!\w)', ' ', text)
+    # Collapse whitespace
+    text = ' '.join(text.split())
+    if len(text) > max_chars:
+        print(f"WARNING: Text truncated from {len(text)} to {max_chars} characters")
+        text = text[:max_chars]
+    return text
+
+
+def chunk_text_for_tts(text: str, chunk_size: int = 50_000) -> list:
+    """Split text into chunks at sentence boundaries for chunked TTS synthesis."""
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks = []
+    while text:
+        if len(text) <= chunk_size:
+            chunks.append(text)
+            break
+        segment = text[:chunk_size]
+        # Find the last sentence boundary in the segment
+        best_idx = -1
+        for sep in ('. ', '? ', '! ', '\n'):
+            idx = segment.rfind(sep)
+            if idx > chunk_size // 2 and idx > best_idx:
+                best_idx = idx
+                best_sep = sep
+        if best_idx == -1:
+            # No good boundary found; break at chunk_size
+            best_idx = chunk_size - 1
+            best_sep = ' '
+        split_at = best_idx + len(best_sep)
+        chunks.append(text[:split_at].strip())
+        text = text[split_at:].strip()
+
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# PDF extraction
+# ---------------------------------------------------------------------------
+
+class PDFExtractor:
+    """Extract text from PDF files."""
+
+    PUBLIC_GROBID_SERVERS = [        "https://grobid.petal.org",
+        "https://orkg.org/grobid",
+        "http://localhost:8070",
+    ]
+
+    def __init__(self, grobid_server: str = None, extraction: str = "auto"):
+        if grobid_server == "local":
+            self.grobid_servers = ["http://localhost:8070"]
+        elif grobid_server and grobid_server != "skip":
+            self.grobid_servers = [grobid_server]
+        else:
+            self.grobid_servers = self.PUBLIC_GROBID_SERVERS
+        # extraction: "auto" | "marker" | "grobid" | "pypdf"
+        self.extraction = extraction
+
+    def extract_with_marker(self, pdf_path: str) -> Optional[Tuple[str, str]]:
+        """Extract text via marker (local ML pipeline). Returns (text, method)."""
+        try:
+            from marker.converters.pdf import PdfConverter
+            from marker.models import create_model_dict
+            from marker.output import text_from_rendered
+            from marker.config.parser import ConfigParser
+
+            print(f"      Running marker (local ML extraction)...")
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            config = ConfigParser({"output_format": "markdown", "device": device})
+            models = create_model_dict(device=device)
+            converter = PdfConverter(config=config.generate_config_dict(), artifact_dict=models)
+            rendered = converter(pdf_path)
+            text, _, _ = text_from_rendered(rendered)
+            if text and text.strip():
+                print(f"OK: Extracted with marker ({len(text):,} chars)")
+                return text, "marker"
+            print("WARNING: marker returned empty text")
+            return None
+        except ImportError:
+            print("WARNING: marker not installed. Run: pip install marker-pdf")
+            return None
+        except Exception as e:
+            print(f"WARNING: marker extraction failed: {str(e)[:80]}")
+            return None
+
+    def extract_with_glm_ocr(self, pdf_path: str) -> Optional[Tuple[str, str]]:
+        """Extract text via GLM-OCR running locally in Ollama. Returns (text, method)."""
+        try:
+            import ollama
+            import fitz  # PyMuPDF
+            import base64
+            from io import BytesIO
+
+            # Check model is available
+            models = ollama.list()
+            model_names = [m.model for m in models.models]
+            if not any("glm-ocr" in m for m in model_names):
+                print("WARNING: glm-ocr not found in Ollama. Run: ollama pull glm-ocr")
+                return None
+
+            print(f"      Running GLM-OCR via Ollama (page-by-page)...")
+            doc = fitz.open(pdf_path)
+            page_texts = []
+
+            for i, page in enumerate(doc):
+                # Render page to image at 150 DPI
+                mat = fitz.Matrix(150 / 72, 150 / 72)
+                pix = page.get_pixmap(matrix=mat)
+                img_bytes = pix.tobytes("jpeg")
+                img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+
+                response = ollama.generate(
+                    model="glm-ocr",
+                    prompt="Text Recognition: ",
+                    images=[img_b64],
+                    stream=False,
+                )
+                page_text = response["response"].strip()
+                if page_text:
+                    page_texts.append(page_text)
+
+                if (i + 1) % 10 == 0 or (i + 1) == len(doc):
+                    print(f"      GLM-OCR: {i + 1}/{len(doc)} pages done")
+
+            doc.close()
+            text = "\n\n".join(page_texts)
+            if text.strip():
+                print(f"OK: Extracted with GLM-OCR ({len(text):,} chars)")
+                return text, "GLM-OCR (Ollama)"
+            print("WARNING: GLM-OCR returned empty text")
+            return None
+        except ImportError as e:
+            print(f"WARNING: GLM-OCR missing dependency: {e}")
+            return None
+        except Exception as e:
+            print(f"WARNING: GLM-OCR extraction failed: {str(e)[:80]}")
+            return None
+
+    def extract_with_grobid(self, pdf_path: str) -> Optional[Tuple[str, str]]:
+        """Extract text via Grobid servers with fallback. Returns (text, method)."""
+        if not requests:
+            return None
+
+        pdf_size_mb = Path(pdf_path).stat().st_size / 1024 / 1024
+        # Large PDFs need more time; cap at 5 minutes
+        timeout = min(max(60, int(pdf_size_mb * 10)), 300)
+
+        for grobid_server in self.grobid_servers:
+            print(f"      Trying Grobid: {grobid_server} (timeout {timeout}s)...")
+            try:
+                with open(pdf_path, 'rb') as f:
+                    response = requests.post(
+                        f"{grobid_server}/api/processFulltextDocument",
+                        files={'input': f},
+                        timeout=timeout
+                    )
+                if response.status_code == 200:
+                    text, structure = self._parse_grobid_xml(response.text)
+                    if text:
+                        method = f"Grobid ({grobid_server.split('/')[-1]}) - {structure}"
+                        print(f"OK: Extracted with {method}")
+                        return text, method
+                    else:
+                        print(f"WARNING: Grobid returned empty text: {grobid_server} - trying next...")
+                else:
+                    print(f"WARNING: Grobid HTTP {response.status_code}: {grobid_server} - trying next...")
+            except requests.exceptions.Timeout:
+                print(f"TIMEOUT: Grobid timeout after {timeout}s: {grobid_server} - trying next...")
+                continue
+            except requests.exceptions.ConnectionError:
+                print(f"WARNING: Grobid unavailable: {grobid_server} - trying next...")
+                continue
+            except Exception as e:
+                print(f"WARNING: Grobid error ({grobid_server}): {str(e)[:50]} - trying next...")
+                continue
+
+        return None
+
+    def _parse_grobid_xml(self, xml_text: str) -> Tuple[str, str]:
+        """Extract text from GROBID XML response. Returns (text, structure_summary)."""
+        try:
+            import xml.etree.ElementTree as ET
+
+            namespaces = {
+                'tei': 'http://www.tei-c.org/ns/1.0',
+                '': 'http://www.tei-c.org/ns/1.0'
+            }
+            for prefix, uri in namespaces.items():
+                ET.register_namespace(prefix, uri)
+
+            root = ET.fromstring(xml_text)
+            ns = {'tei': 'http://www.tei-c.org/ns/1.0'}
+
+            content_parts = []
+            sections = []
+
+            abstract = root.find('.//tei:abstract', ns)
+            if abstract is not None:
+                abs_text = self._extract_text_from_element(abstract, ns)
+                if abs_text.strip():
+                    content_parts.append("## Abstract\n\n" + abs_text)
+                    sections.append("abstract")
+
+            body = root.find('.//tei:body', ns)
+            if body is not None:
+                body_text = self._extract_body_text(body, ns)
+                if body_text.strip():
+                    content_parts.append(body_text)
+                    sections.append("body")
+
+            if not content_parts:
+                text_parts = []
+                for elem in root.iter():
+                    if elem.text and elem.text.strip():
+                        text_parts.append(elem.text.strip())
+                return '\n\n'.join(text_parts), "fallback"
+
+            full_text = '\n\n'.join(content_parts)
+            return full_text, ', '.join(sections) if sections else "partial"
+
+        except Exception as e:
+            print(f"WARNING: XML parsing failed: {e}")
+            return None, "error"
+
+    def _extract_text_from_element(self, elem, ns: dict) -> str:
+        """Extract all text from an element and its children."""
+        text_parts = []
+        if elem.text and elem.text.strip():
+            text_parts.append(elem.text.strip())
+        for child in elem.iter():
+            if child != elem and child.text and child.text.strip():
+                text_parts.append(child.text.strip())
+            if child.tail and child.tail.strip() and child != elem:
+                text_parts.append(child.tail.strip())
+        return ' '.join(text_parts)
+
+    def _extract_body_text(self, body_elem, ns: dict) -> str:
+        """Extract body sections with hierarchical structure."""
+        content_parts = []
+
+        for div in body_elem.findall('.//tei:div', ns):
+            head = div.find('tei:head', ns)
+            if head is not None:
+                title = self._extract_text_from_element(head, ns).strip()
+                if title:
+                    content_parts.append(f"## {title}\n")
+
+            for para in div.findall('.//tei:p', ns):
+                para_text = self._extract_text_from_element(para, ns).strip()
+                if para_text:
+                    content_parts.append(para_text)
+
+        if not content_parts:
+            for para in body_elem.findall('.//tei:p', ns):
+                para_text = self._extract_text_from_element(para, ns).strip()
+                if para_text:
+                    content_parts.append(para_text)
+
+        return '\n\n'.join(content_parts)
+
+    def extract_with_pypdf(self, pdf_path: str) -> Optional[Tuple[str, str]]:
+        """Extract text via PyPDF2 (fallback). Returns (text, method)."""
+        if not PyPDF2:
+            return None
+        try:
+            with open(pdf_path, 'rb') as f:
+                reader = PyPDF2.PdfReader(f)
+                text = ''
+                for page in reader.pages:
+                    text += page.extract_text() + '\n'
+            if text.strip():
+                return text, "PyPDF2"
+            return None
+        except Exception as e:
+            print(f"WARNING: PyPDF2 extraction failed: {e}")
+            return None
+
+    def extract_text(self, pdf_path: str, output_dir: Path = None) -> Tuple[str, str]:
+        """Extract text from PDF with fallback chain. Returns (text, method_used).
+
+        Extraction order (auto): glm-ocr -> marker -> grobid -> pypdf
+        Override with --extraction glm-ocr|marker|grobid|pypdf to force a specific method.
+        """
+        print(f"Extracting text from: {Path(pdf_path).name}")
+
+        # Build the ordered list of methods to try
+        if self.extraction == "glm-ocr":
+            methods = [self.extract_with_glm_ocr]
+        elif self.extraction == "marker":
+            methods = [self.extract_with_marker]
+        elif self.extraction == "grobid":
+            methods = [self.extract_with_grobid]
+        elif self.extraction == "pypdf":
+            methods = [self.extract_with_pypdf]
+        else:
+            # auto: GLM-OCR first (fast, local, document-aware), then marker, grobid, pypdf
+            methods = [self.extract_with_glm_ocr, self.extract_with_marker, self.extract_with_grobid, self.extract_with_pypdf]
+
+        for method_fn in methods:
+            result = method_fn(pdf_path)
+            if result:
+                text, method = result
+                if output_dir:
+                    self._save_extracted_text(Path(pdf_path).stem, text, method, output_dir)
+                return text, method
+
+        raise ValueError(f"Could not extract text from {pdf_path}. Ensure it's not a scanned image.")
+
+    def _save_extracted_text(self, pdf_name: str, text: str, method: str, output_dir: Path):
+        """Save raw extracted text as markdown file with metadata."""
+        md_file = output_dir / f"{pdf_name}_extracted.md"
+        metadata = f"""---
+extraction_method: {method}
+date_extracted: {datetime.now().isoformat()}
+character_count: {len(text)}
+word_count: {len(text.split())}
+---
+
+# {pdf_name} - Extracted Text
+
+**Extraction Method**: {method}
+**Characters**: {len(text):,}
+**Words**: {len(text.split()):,}
+**Date**: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+---
+
+{text}
+"""
+        md_file.write_text(metadata, encoding='utf-8')
+        print(f"Raw text saved: {md_file.name}")
+
+
+# ---------------------------------------------------------------------------
+# TTS
+# ---------------------------------------------------------------------------
+
+class UnifiedSpeechAPI:
+    """Unified interface for multiple TTS engines."""
+
+    @staticmethod
+    def synthesize_edge_tts(
+        text: str,
+        output_path: str,
+        voice: str = "en-US-AriaNeural",
+        timing_path: str = None,
+    ) -> bool:
+        """Synthesize speech using Edge TTS, chunking large texts automatically."""
+        try:
+            import asyncio
+            import json
+            import tempfile
+            from edge_tts import Communicate
+
+            chunks = chunk_text_for_tts(text)
+            total_chars = len(text)
+            print(f"Generating audio with Edge TTS...")
+            print(f"   Voice: {voice}")
+            print(f"   Text length: {total_chars:,} characters")
+            if len(chunks) > 1:
+                print(f"   Chunks: {len(chunks)} (large text split at sentence boundaries)")
+
+            all_word_boundaries = []
+            chunk_audio_paths = []
+            time_offset = 0.0
+
+            async def tts_chunk_async(chunk_text, chunk_path):
+                boundaries = []
+                communicate = Communicate(text=chunk_text, voice=voice, rate="+20%")
+                with open(chunk_path, "wb") as audio_file:
+                    async for item in communicate.stream():
+                        if item["type"] == "audio":
+                            audio_file.write(item["data"])
+                        elif item["type"] in ("WordBoundary", "SentenceBoundary"):
+                            boundaries.append({
+                                "word":      item["text"],
+                                "start_sec": item["offset"] / 10_000_000,
+                            })
+                return boundaries
+
+            import time as _time
+            tmp_dir = tempfile.mkdtemp()
+            for i, chunk in enumerate(chunks):
+                if len(chunks) > 1:
+                    print(f"   Processing chunk {i+1}/{len(chunks)} ({len(chunk):,} chars)...")
+                chunk_path = os.path.join(tmp_dir, f"chunk_{i:04d}.mp3")
+                # Retry up to 3 times per chunk on NoAudioReceived
+                for attempt in range(3):
+                    try:
+                        boundaries = asyncio.run(tts_chunk_async(chunk, chunk_path))
+                        break
+                    except Exception as exc:
+                        if attempt < 2 and "NoAudioReceived" in type(exc).__name__:
+                            wait = (attempt + 1) * 5
+                            print(f"   WARNING: No audio received (attempt {attempt+1}/3), retrying in {wait}s...")
+                            _time.sleep(wait)
+                        else:
+                            raise
+                # Offset timing data by accumulated duration
+                for b in boundaries:
+                    all_word_boundaries.append({
+                        "word":      b["word"],
+                        "start_sec": b["start_sec"] + time_offset,
+                    })
+                chunk_audio_paths.append(chunk_path)
+                # Estimate duration offset from last boundary (rough)
+                if boundaries:
+                    time_offset = all_word_boundaries[-1]["start_sec"] + 0.5
+                # Brief pause between chunks to avoid rate limiting
+                if i < len(chunks) - 1:
+                    _time.sleep(2)
+
+            # Concatenate chunk MP3s into final output
+            output_file = Path(output_path)
+            with open(output_file, "wb") as out_f:
+                for chunk_path in chunk_audio_paths:
+                    cp = Path(chunk_path)
+                    if cp.exists():
+                        out_f.write(cp.read_bytes())
+                        cp.unlink()
+
+            # Clean up temp dir
+            try:
+                os.rmdir(tmp_dir)
+            except OSError:
+                pass
+
+            if not output_file.exists() or output_file.stat().st_size == 0:
+                print("FAILED: Audio file was not created")
+                return False
+
+            file_size = output_file.stat().st_size / 1024 / 1024
+            print(f"OK: Audio generated ({output_file.name}, {file_size:.1f} MB)")
+
+            # Save timing sidecar
+            if timing_path and all_word_boundaries:
+                Path(timing_path).write_text(
+                    json.dumps(all_word_boundaries, indent=2), encoding="utf-8"
+                )
+                print(f"OK: Timing saved ({len(all_word_boundaries):,} words -> {Path(timing_path).name})")
+
+            return True
+
+        except ImportError:
+            print("FAILED: edge-tts not found. Install with: pip install edge-tts")
+            return False
+        except Exception as e:
+            print(f"FAILED: Edge TTS error: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    @staticmethod
+    def synthesize_coqui(text: str, output_path: str, speaker: str = "p225") -> bool:
+        """Synthesize speech using Coqui TTS (local)."""
+        try:
+            from TTS.api import TTS
+
+            print(f"Generating audio with Coqui TTS...")
+            tts = TTS(model_name="tts_models/en/ljspeech/glow-tts",
+                      progress_bar=True, gpu=False)
+            tts.tts_to_file(text=text, file_path=output_path)
+
+            output_file = Path(output_path)
+            if output_file.exists():
+                file_size = output_file.stat().st_size / 1024 / 1024
+                print(f"OK: Audio generated ({Path(output_path).name}, {file_size:.1f} MB)")
+                return True
+            else:
+                print("FAILED: Audio file was not created")
+                return False
+
+        except ImportError:
+            print("FAILED: Coqui TTS not found. Install with: pip install TTS")
+            return False
+        except Exception as e:
+            print(f"FAILED: Coqui TTS error: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Obsidian note generator
+# ---------------------------------------------------------------------------
+
+def create_obsidian_note(
+    pdf_stem: str,
+    pdf_name: str,
+    audio_filename: str,
+    extracted_text: str,
+    extraction_method: str,
+    tts_method: str,
+    output_dir: Path,
+) -> Path:
+    """Create a YouTube-style Obsidian note for a converted PDF."""
+
+    note_path = output_dir / f"{pdf_stem}.md"
+    today = datetime.now().strftime("%Y-%m-%d")
+    word_count = len(extracted_text.split())
+
+    # Vault-relative path so AUDIO_PLAYER can find the file
+    media_folder = "09_audio_video_notes/pdf_audio_outputs"
+
+    title_yaml = pdf_stem.replace('"', "'")
+
+    note_content = f"""---
+title: "{title_yaml}"
+type: "pdf-audio"
+date_added: {today}
+source_pdf: "{pdf_name}"
+media_folder: "{media_folder}"
+audio_file: "{audio_filename}"
+extraction_method: "{extraction_method}"
+tts_method: "{tts_method}"
+word_count: {word_count}
+character_count: {len(extracted_text)}
+status: "to_listen"
+---
+
+# {pdf_stem}
+
+| | |
+|---|---|
+| **Source** | {pdf_name} |
+| **Words** | {word_count:,} |
+| **Extracted via** | {extraction_method} |
+| **Audio via** | {tts_method} |
+| **Date** | {today} |
+
+---
+
+## Listen
+
+{AUDIO_PLAYER}
+
+{TIMESTAMP_BUTTON}
+
+*[🔍 Extract transcript for timestamps](obsidian://shell-commands?vault=obsidian&execute=extract-transcript-all)*
+
+{TRANSCRIBE_BUTTON}
+
+---
+
+## Notes
+
+<!-- Add your notes here as you listen -->
+
+---
+
+## Key Points
+
+-
+
+---
+
+## Action Items
+
+- [ ]
+
+---
+
+## Timestamps
+
+---
+
+## Full Text
+
+{extracted_text}
+"""
+
+    note_path.write_text(note_content, encoding='utf-8')
+    print(f"OK: Note created: {note_path.name}")
+    return note_path
+
+
+# ---------------------------------------------------------------------------
+# Core processor
+# ---------------------------------------------------------------------------
+
+def process_pdf(
+    pdf_path: Path,
+    output_audio_dir: Path,
+    output_notes_dir: Path,
+    output_extracted_dir: Path,
+    vault: Path,
+    tts_method: str = "edge-tts",
+    grobid_server: str = None,
+    extraction: str = "auto",
+) -> bool:
+    """Process a single PDF file."""
+
+    import time
+    start_time = time.time()
+    progress = Progress(vault, pdf_path.name)
+
+    print(f"Processing: {pdf_path.name}")
+
+    # 1. Extract text
+    progress.step(1)
+    print(f"[1/4] Extracting text from PDF...")
+    extractor = PDFExtractor(grobid_server=grobid_server, extraction=extraction)
+    try:
+        extracted_text, extraction_method = extractor.extract_text(
+            str(pdf_path), output_extracted_dir
+        )
+        elapsed = time.time() - start_time
+        print(f"      OK: Extraction complete ({elapsed:.1f}s) - {extraction_method}")
+    except Exception as e:
+        progress.error("Extracting text", str(e))
+        print(f"      FAILED: Extraction failed: {e}")
+        return False
+
+    # 2. Prepare text for TTS (strip markdown headers + collapse whitespace)
+    progress.step(2)
+    print(f"[2/4] Preparing text for TTS...")
+    tts_text = clean_text_for_tts(extracted_text)
+    print(f"      OK: {len(tts_text):,} characters ready")
+
+    # 3. Generate audio
+    progress.step(3, f"{len(tts_text):,} characters")
+    print(f"[3/4] Converting text to speech...")
+    audio_filename = pdf_path.stem + ".mp3"
+    audio_path = output_audio_dir / audio_filename
+    timing_filename = pdf_path.stem + "_timing.json"
+    timing_path = output_audio_dir / timing_filename
+
+    if tts_method == "edge-tts":
+        success = UnifiedSpeechAPI.synthesize_edge_tts(
+            tts_text, str(audio_path), timing_path=str(timing_path)
+        )
+    else:
+        success = UnifiedSpeechAPI.synthesize_coqui(tts_text, str(audio_path))
+
+    if not success:
+        progress.error("Converting text to speech", "TTS synthesis failed")
+        print("      FAILED: TTS synthesis failed")
+        return False
+
+    # 4. Create Obsidian note
+    progress.step(4)
+    print(f"[4/4] Creating Obsidian note...")
+    try:
+        create_obsidian_note(
+            pdf_stem=pdf_path.stem,
+            pdf_name=pdf_path.name,
+            audio_filename=audio_filename,
+            extracted_text=extracted_text,
+            extraction_method=extraction_method,
+            tts_method=tts_method,
+            output_dir=output_notes_dir,
+        )
+    except Exception as e:
+        progress.error("Creating Obsidian note", str(e))
+        print(f"      FAILED: Note generation failed: {e}")
+        return False
+
+    elapsed = time.time() - start_time
+    progress.done(pdf_path.stem, elapsed)
+    print(f"COMPLETE: {pdf_path.name} ({elapsed:.1f}s)")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Home note helpers
+# ---------------------------------------------------------------------------
+
+def add_listen_task(home_note: str, pdf_stem: str, today: str):
+    """Insert a Listen task into the ## Watchlist section of the home note."""
+    task_line = f"- [ ] Listen [[{pdf_stem}]] 📅 {today}"
+    try:
+        with open(home_note, encoding="utf-8") as f:
+            home = f.read()
+
+        marker = "## Watchlist"
+        if marker in home:
+            home = home.replace(
+                marker + "\n",
+                marker + "\n\n" + task_line + "\n",
+                1,
+            )
+        else:
+            home = home + f"\n\n{marker}\n\n{task_line}\n"
+
+        with open(home_note, "w", encoding="utf-8") as f:
+            f.write(home)
+
+        print(f"OK: Task added to home note: Listen {pdf_stem}")
+    except OSError as e:
+        print(f"WARNING: Could not update home note: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Convert PDF to audiobook with YouTube-style Obsidian note",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  py -3 pdf_to_speech.py --vault "C:\\vault" --note "C:\\vault\\09_audio_video_notes\\01 - Home_Audio_Video.md"
+  py -3 pdf_to_speech.py --vault "C:\\vault" --note "..." --pdf "paper.pdf"
+  py -3 pdf_to_speech.py --vault "C:\\vault" --note "..." --tts coqui
+        """
+    )
+    parser.add_argument("--vault", required=True, help="Absolute path to Obsidian vault root")
+    parser.add_argument("--note",  required=True, help="Absolute path to home note")
+    parser.add_argument("--tts",   choices=["edge-tts", "coqui"], default="edge-tts")
+    parser.add_argument("--grobid", default=None,
+                        help="Grobid server URL, 'local', or 'skip'")
+    parser.add_argument("--extraction", choices=["auto", "glm-ocr", "marker", "grobid", "pypdf"],
+                        default="auto",
+                        help="Extraction method: auto (glm-ocr->marker->grobid->pypdf), glm-ocr, marker, grobid, or pypdf")
+    parser.add_argument("--pdf",   type=str, default=None,
+                        help="PDF filename (just the name, not full path) or full path")
+
+    args = parser.parse_args()
+
+    vault = Path(args.vault.rstrip("\\/"))
+    base_dir = vault / "09_audio_video_notes"
+    input_dir = base_dir / "pdfs_to_convert"
+    output_audio_dir = base_dir / "pdf_audio_outputs"
+    output_notes_dir = base_dir          # Notes go directly into 09_audio_video_notes/
+    output_extracted_dir = base_dir / "pdf_extracted_text"
+    pending_file = vault / "99 - System" / "pdf_to_convert_pending.txt"
+
+    output_audio_dir.mkdir(exist_ok=True)
+    output_extracted_dir.mkdir(exist_ok=True)
+
+    # Determine which PDF to process
+    if args.pdf:
+        pdf_arg = Path(args.pdf)
+        pdf_path = pdf_arg if pdf_arg.is_absolute() else input_dir / pdf_arg
+    elif pending_file.exists():
+        pdf_name = pending_file.read_text(encoding="utf-8").strip()
+        if not pdf_name:
+            print("FAILED: pdf_to_convert_pending.txt is empty. Select a PDF and try again.")
+            return 1
+        pdf_path = input_dir / pdf_name
+        # Clear the pending file
+        pending_file.write_text("", encoding="utf-8")
+    else:
+        # Fallback: process all PDFs in input_dir
+        pdf_files = list(input_dir.glob("*.pdf"))
+        if not pdf_files:
+            print(f"INFO: No PDFs found in: {input_dir}")
+            print("Place PDF files in the 'pdfs_to_convert' folder to begin.")
+            return 0
+        pdf_path = pdf_files[0]
+        print(f"No PDF specified; using first found: {pdf_path.name}")
+
+    if not pdf_path.exists():
+        print(f"FAILED: PDF not found: {pdf_path}")
+        return 1
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    success = process_pdf(
+        pdf_path=pdf_path,
+        output_audio_dir=output_audio_dir,
+        output_notes_dir=output_notes_dir,
+        output_extracted_dir=output_extracted_dir,
+        vault=vault,
+        tts_method=args.tts,
+        grobid_server=args.grobid,
+        extraction=args.extraction,
+    )
+
+    if success:
+        # Add Listen task to home note
+        add_listen_task(args.note, pdf_path.stem, today)
+
+        # Archive the processed PDF
+        archive_dir = input_dir / "_processed"
+        archive_dir.mkdir(exist_ok=True)
+        dest = archive_dir / pdf_path.name
+        if dest.exists():
+            dest.unlink()
+        pdf_path.rename(dest)
+        print(f"OK: PDF archived to: _processed/{pdf_path.name}")
+
+    return 0 if success else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
