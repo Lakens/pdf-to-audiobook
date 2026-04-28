@@ -147,3 +147,32 @@ For a full academic book (~330 pages), expect 1–2 hours total.
 - If Ollama is not running, GLM-OCR will fail and the script falls back to marker, then PyPDF2.
 - The extracted text is always saved separately so you can inspect quality before committing to TTS.
 - For very large books, Edge TTS occasionally drops a chunk (`NoAudioReceived`). Re-running the script will redo only the failed run.
+
+---
+
+## Change Log
+
+### 2026-04-28 — Improved TTS cleanup pipeline
+
+Enhanced `clean_text_for_tts()` with four new text filtering features to improve audiobook quality:
+
+1. **References cutoff** — Detects common reference section headings (References, Bibliography, Works Cited, Literature Cited) and discards all text from that point onward. Prevents reading of citation lists that add no value to speech output.
+
+2. **Non-prose filtering** — Removes tables, figures, image captions, and DOI-only lines before TTS. Academic papers often contain dense tables and figure captions that don't narrate well; filtering these improves listening flow.
+
+3. **Formula normalization** — Converts mathematical notation to speech-friendly text:
+   - Unicode symbols: `≤` → "less than or equal to", `α` → "alpha", `π` → "pi"
+   - p-value notation: `p < .05` → "p less than 0.05"
+   - LaTeX fragments: `\frac{a}{b}` → "a over b"
+
+4. **Citation compression** — Shortens in-text citations and reference lists:
+   - Parenthetical citations: `(Smith & Jones, 2020; cf. Brown et al., 2019)` → `(citation)`
+   - Bracketed citations: `[1, 2, 3]` → `[citation]`
+   Preserves structural markers while reducing auditory noise.
+
+**Pipeline improvements:**
+- Markdown header stripping moved before paragraph joining to prevent headers from becoming inline noise
+- Intelligent paragraph joining replaces blanket period insertion; preserves existing punctuation boundaries
+- Formula normalization converts symbols to speech rather than silent removal for mathematical papers
+
+**Scope:** All four improvements are generic text filters and apply identically to both standalone and Obsidian versions.

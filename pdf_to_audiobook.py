@@ -156,23 +156,174 @@ def extract_text(pdf_path: Path, method: str = "auto") -> Tuple[str, str]:
 # Text cleaning
 # ---------------------------------------------------------------------------
 
+def strip_markdown_headers(text: str) -> str:
+    """Replace markdown header markers with plain text so TTS doesn't read '##'."""
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'(?<!\w)#{1,6}\s+(?=[A-Za-z0-9])', '', text)
+    return text
+
+
+def remove_non_speech_sections(text: str) -> str:
+    """Drop references and non-prose blocks that hurt audiobook flow."""
+    lines = text.splitlines()
+    stop_headings = {
+        "references",
+        "bibliography",
+        "works cited",
+        "literature cited",
+    }
+
+    cutoff = len(lines)
+    for idx, line in enumerate(lines):
+        heading = re.sub(r'^\s*#{0,6}\s*', '', line).strip().lower()
+        heading = re.sub(r'\s*[:\-]+\s*$', '', heading)
+        if heading in stop_headings:
+            cutoff = idx
+            break
+
+    filtered = []
+    for line in lines[:cutoff]:
+        s = line.strip()
+        if not s:
+            filtered.append("")
+            continue
+
+        if re.match(r'!\[[^\]]*\]\([^\)]+\)$', s):
+            continue
+        if re.match(r'^\|.*\|$', s):
+            continue
+        if re.match(r'^(?:https?://|doi\.org/|doi:\s*)', s, flags=re.IGNORECASE):
+            continue
+        if re.match(r'^(?:figure|fig\.?|table)\s*\d+[A-Za-z]?(?:\.\d+)?\s*[:\.\-)\s]', s, flags=re.IGNORECASE):
+            continue
+
+        filtered.append(line)
+
+    return "\n".join(filtered)
+
+
+def normalize_formula_text(text: str) -> str:
+    """Convert common formula notation into speech-friendly plain text."""
+    replacements = {
+        "≤": " less than or equal to ",
+        "≥": " greater than or equal to ",
+        "≠": " not equal to ",
+        "≈": " approximately ",
+        "±": " plus or minus ",
+        "α": " alpha ",
+        "β": " beta ",
+        "γ": " gamma ",
+        "δ": " delta ",
+        "μ": " mu ",
+        "σ": " sigma ",
+        "λ": " lambda ",
+        "θ": " theta ",
+        "π": " pi ",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+
+    # Common p-value notation
+    text = re.sub(r'\bp\s*(?:<=|=<)\s*\.?([0-9]+)\b', r'p less than or equal to 0.\1', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bp\s*(?:>=|=>)\s*\.?([0-9]+)\b', r'p greater than or equal to 0.\1', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bp\s*<\s*\.?([0-9]+)\b', r'p less than 0.\1', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bp\s*>\s*\.?([0-9]+)\b', r'p greater than 0.\1', text, flags=re.IGNORECASE)
+
+    def _latex_to_speech(expr: str) -> str:
+        expr = re.sub(r'\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}', r' \1 over \2 ', expr)
+        expr = re.sub(r'\\(alpha|beta|gamma|delta|mu|sigma|lambda|theta|pi)\b', r' \1 ', expr)
+        expr = re.sub(r'\\(leq|le)\b', ' less than or equal to ', expr)
+        expr = re.sub(r'\\(geq|ge)\b', ' greater than or equal to ', expr)
+        expr = re.sub(r'\\neq\b', ' not equal to ', expr)
+        expr = re.sub(r'\\approx\b', ' approximately ', expr)
+        expr = re.sub(r'\\pm\b', ' plus or minus ', expr)
+        expr = re.sub(r'\\times\b', ' times ', expr)
+        expr = re.sub(r'\\mid\b', ' given ', expr)
+        expr = re.sub(r'[_^]\{?([^{}\s]+)\}?', r' \1 ', expr)
+        expr = re.sub(r'\\[A-Za-z]+', ' ', expr)
+        expr = re.sub(r'[{}]', ' ', expr)
+        expr = re.sub(r'\s+', ' ', expr).strip()
+        return expr
+
+    text = re.sub(r'\$\$(.*?)\$\$', lambda m: f" {_latex_to_speech(m.group(1))} ", text, flags=re.DOTALL)
+    text = re.sub(r'\$([^$\n]+?)\$', lambda m: f" {_latex_to_speech(m.group(1))} ", text)
+
+    return text
+
+
+def compress_in_text_citations(text: str) -> str:
+    """Shorten in-line citation noise while preserving sentence flow."""
+    def _paren_repl(match: re.Match) -> str:
+        body = match.group(1)
+        has_year = re.search(r'\b\d{4}[a-z]?\b', body) is not None
+        looks_citation = has_year and (
+            ';' in body
+            or '&' in body
+            or 'et al' in body.lower()
+            or re.search(r'\b[A-Z][A-Za-z\-\'\.]+\s*,\s*\d{4}', body) is not None
+        )
+        if looks_citation:
+            return ' (citation) '
+        return match.group(0)
+
+    text = re.sub(r'\(([^()]{3,220})\)', _paren_repl, text)
+    text = re.sub(r'\[(?:\d{1,3}\s*(?:,|;)?\s*){1,8}\]', ' [citation] ', text)
+    return text
+
+
+def join_paragraphs_for_tts(text: str) -> str:
+    """Join paragraph fragments with minimal punctuation for smoother speech."""
+    paragraphs = [p.strip() for p in re.split(r'\n{2,}', text) if p.strip()]
+    if not paragraphs:
+        return ""
+
+    merged = [paragraphs[0]]
+    for para in paragraphs[1:]:
+        prev = merged[-1]
+        if re.search(r'[.!?]["\'\)\]]?\s*$', prev):
+            merged.append(para)
+        else:
+            merged[-1] = prev.rstrip() + "."
+            merged.append(para)
+
+    return " ".join(merged)
+
+
 def clean_text_for_tts(text: str) -> str:
     """Remove markdown and symbols that TTS reads aloud awkwardly."""
-    # Markdown headers -> plain text
-    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-    # Bold/italic asterisks
+    # Remove hyphenated line-break artifacts early
+    text = re.sub(r'-\s*\n\s*', '', text)
+    # Remove markdown headers
+    text = strip_markdown_headers(text)
+    # Remove references and figure/table noise before joining paragraphs
+    text = remove_non_speech_sections(text)
+    # Join paragraphs with minimal pauses
+    text = join_paragraphs_for_tts(text)
+    # Convert formulas and symbols to speech-friendly text
+    text = normalize_formula_text(text)
+    # Remove markdown formatting
     text = re.sub(r'\*{1,3}', '', text)
-    # _subscript_ or __text__ -> inner text
     text = re.sub(r'_{1,2}([^_]+)_{1,2}', r'\1', text)
-    # ^superscript^ -> removed
     text = re.sub(r'\^([^\s^]+)\^?', '', text)
-    # Inline code
     text = re.sub(r'`[^`]*`', '', text)
-    # [label](url) -> label
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
-    # ![image](url) -> removed
     text = re.sub(r'!\[[^\]]*\]\([^\)]+\)', '', text)
-    # Lone special chars
+    # Square brackets and curly braces
+    text = re.sub(r'\[([^\]]+)\]', r'\1', text)
+    text = re.sub(r'\{([^}]+)\}', r'\1', text)
+    # Lone dollar signs
+    text = re.sub(r'\$', '', text)
+    # p. / pp. -> page / pages
+    text = re.sub(r'\bpp\.\s*(\d)', r'pages \1', text)
+    text = re.sub(r'\bp\.\s*(\d)', r'page \1', text)
+    # ALL CAPS to title case
+    text = re.sub(r'\b([A-Z]{2,})(?:\s+[A-Z]{2,})*\b', lambda m: m.group(0).title(), text)
+    # Compress citations
+    text = compress_in_text_citations(text)
+    # Normalize repeated punctuation
+    text = re.sub(r'(?:\s*\.\s*){3,}', '... ', text)
+    text = re.sub(r'\.{4,}', '... ', text)
+    # Remove lone special chars
     text = re.sub(r'(?<!\w)[~^|\\](?!\w)', ' ', text)
     # Collapse whitespace
     text = ' '.join(text.split())
