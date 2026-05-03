@@ -198,6 +198,85 @@ python pdf_to_speech.py --grobid local
 python pdf_to_speech.py --grobid skip
 ```
 
+### Vision-Based OCR: GLM-OCR Extraction
+
+For **scanned PDFs or image-based content**, use the Ollama-hosted GLM-OCR model:
+
+```powershell
+# Requires: Ollama running with glm-ocr:latest model
+# GPU: RTX A1000 6GB or similar (CUDA-enabled)
+python pdf_to_speech.py --extraction glm-ocr
+```
+
+**Advantages:**
+- Handles scanned documents that text extraction cannot (images as first-class content)
+- Robust fallback system for memory-constrained GPUs
+- Per-page OCR with automatic recovery
+
+**Performance:**
+- ~26-40 seconds per page depending on page complexity (RTX A1000 6GB)
+- Adaptive memory management with intelligent fallback strategies
+- Tested on 28 + 24 page PDFs with 100% completion rate
+
+**Setup:**
+```powershell
+# Install Ollama from https://ollama.ai
+ollama pull glm-ocr:latest
+ollama serve  # Start the Ollama server in a separate terminal
+# Then run the converter in another terminal
+```
+
+### Handling GPU Memory Crashes (Ollama Worker Crash Pattern)
+
+**What happens:**
+When extracting dense/complex PDF pages on GPUs with limited VRAM (~6GB), the OCR worker may crash with:
+- Timeout after 60+ seconds on full-page 1024×1024px rendering
+- Ollama worker process dies silently
+- Subsequent attempts fail with "connection refused"
+
+**Root cause:**
+Full-page image normalization + vision model inference on memory-constrained GPU exceeds available VRAM, causing allocation failures.
+
+**How we fixed it (automatic in current code):**
+
+1. **Adaptive image downscaling** — If a page times out at full resolution:
+   - Attempt 1: 1024 px (full quality)
+   - Attempt 2: 896 px (reduced memory pressure)
+   - Attempt 3: 768 px (further reduction)
+
+2. **Tiled fallback** — If downscaling also times out, automatically decompose the page into 4 tiles:
+   - Upper-left, upper-right, lower-left, lower-right quadrants
+   - OCR each tile independently at normalized resolution
+   - Reassemble results into single page text
+   - Requires worker restart before tiling (handled automatically)
+
+**Result:**
+In testing, this recovered **7 out of 7 previously-failing pages** on a multi-page PDF batch without manual intervention. 100% completion rate achieved on 28 and 24-page PDFs despite initial worker crashes.
+
+**You don't need to do anything** — the converter handles all recovery automatically. If you see messages like:
+```
+GLM-OCR page 7: trying tiled fallback (GLM-only) after page failure: Timeout
+```
+
+This is normal and expected. The page will complete via tiling.
+
+### Marker Fast Mode
+
+For faster Marker extraction without HTML/layout preservation:
+```powershell
+python pdf_to_speech.py --extraction marker --marker-mode fast
+```
+
+Fast mode trades strict layout accuracy for speed by:
+- Disabling bounding box metadata (`ocr_without_boxes`)
+- Skipping math-region detection (`disable_ocr_math`)
+- Using larger batch sizes (recognition: 96, layout: 12, detection: 8)
+
+**Note:** Marker startup may hang on Windows if Ollama is using GPU memory. Stop Ollama first:
+```powershell
+Stop-Process -Name ollama -Force -ErrorAction SilentlyContinue
+```
+
 ## File Structure
 
 ```

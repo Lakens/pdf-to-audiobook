@@ -31,10 +31,6 @@ try:
 except ImportError:
     requests = None
 
-try:
-    import PyPDF2
-except ImportError:
-    PyPDF2 = None
 
 
 # ---------------------------------------------------------------------------
@@ -288,58 +284,105 @@ TRANSCRIBE_BUTTON = r"""```dataviewjs
 # Progress reporter — writes directly to a vault file so Obsidian can read it
 # ---------------------------------------------------------------------------
 
+import re as _re
+
+def _strip_code_fences(text: str) -> str:
+    """Strip markdown code fences that GLM-OCR sometimes wraps around output."""
+    blocks = _re.split(r"```[a-zA-Z]*\n?", text)
+    if len(blocks) <= 1:
+        return text.strip()
+    inner = [b.strip() for b in blocks if b.strip()]
+    joined = "\n\n".join(inner) if inner else text.strip()
+    cleaned = [ln for ln in joined.splitlines()
+               if not _re.match(r"^```[a-zA-Z]*$", ln.strip())]
+    return "\n".join(cleaned).strip()
+
 class Progress:
-    """Writes live progress to a markdown file inside the vault."""
+    """Writes live progress to pdf_convert_progress.md, polled by Obsidian DataviewJS."""
 
     STEPS = [
-        "Extracting text from PDF",
-        "Preparing text for TTS",
-        "Converting text to speech",
-        "Creating Obsidian note",
+        ("🔍", "Extracting text from PDF"),
+        ("✂️", "Preparing text for TTS"),
+        ("🔊", "Converting text to speech"),
+        ("📝", "Creating Obsidian note"),
     ]
 
-    def __init__(self, vault: Path, pdf_name: str):
+    def __init__(self, vault: Path, pdf_name: str,
+                 batch_index: int = 0, batch_total: int = 1,
+                 completed_log: list = None):
         self.path = vault / "99 - System" / "pdf_convert_progress.md"
         self.pdf_name = pdf_name
+        self.batch_index = batch_index
+        self.batch_total = batch_total
+        self.completed_log = completed_log or []
         self.current_step = 0
-        self.total_steps = len(self.STEPS)
-        self._write("Starting...")
+        self._substep_line = ""
+        self._render()
 
     def step(self, n: int, detail: str = ""):
-        """Mark step n (1-based) as in progress."""
         self.current_step = n
-        bar = self._bar(n - 1, self.total_steps)
-        lines = [
-            f"**Converting:** {self.pdf_name}",
-            f"",
-            f"{bar}  Step {n}/{self.total_steps}",
-            f"",
-            f"**{self.STEPS[n-1]}**" + (f" — {detail}" if detail else ""),
-        ]
-        self._write("\n".join(lines))
+        self._substep_line = ""
+        self._render(detail)
+
+    def substep(self, n: int, label: str, done: int, total: int):
+        self._substep_line = (
+            f"`{self._bar(done, total, 20)}`  {done}/{total}  ({label})"
+        )
+        self._render()
 
     def done(self, note_name: str, elapsed: float):
-        bar = self._bar(self.total_steps, self.total_steps)
-        lines = [
-            f"**Done:** {self.pdf_name}",
-            f"",
-            f"{bar}  Complete ({elapsed:.0f}s)",
-            f"",
-            f"Note created: [[{note_name}]]",
-        ]
-        self._write("\n".join(lines))
+        self.current_step = len(self.STEPS)
+        self._substep_line = ""
+        self._render()
 
     def error(self, step_name: str, msg: str):
-        lines = [
-            f"**FAILED** at: {step_name}",
-            f"",
-            f"Error: {msg}",
-        ]
+        lines = [self._batch_header(),
+                 f"",
+                 f"**FAILED** — {self.pdf_name}",
+                 f"Step: {step_name}",
+                 f"Error: {msg[:120]}"]
         self._write("\n".join(lines))
 
-    def _bar(self, done: int, total: int) -> str:
-        filled = round(done / total * 20)
-        return "[" + "#" * filled + "-" * (20 - filled) + "]"
+    # ------------------------------------------------------------------ #
+
+    def _batch_header(self) -> str:
+        done = len(self.completed_log)
+        bar = self._bar(done, self.batch_total, 30)
+        return f"### Batch: {done}/{self.batch_total} complete `{bar}`  {done}/{self.batch_total} PDFs"
+
+    def _render(self, detail: str = ""):
+        n = self.current_step
+        lines = [
+            self._batch_header(),
+            f"",
+            f"**Now:** {self.pdf_name}  *(PDF {self.batch_index+1}/{self.batch_total})*",
+            f"",
+        ]
+        icons = ["⏳", "✅"]
+        for i, (icon, label) in enumerate(self.STEPS):
+            step_n = i + 1
+            if step_n < n:
+                lines.append(f"✅ {icon} {label}")
+            elif step_n == n:
+                d = f" — {detail}" if detail else ""
+                lines.append(f"⏳ {icon} {label}{d}")
+            else:
+                lines.append(f"⬜ {icon} {label}")
+
+        if n > 0:
+            lines.append(f"")
+            lines.append(f"`{self._bar(n-1, len(self.STEPS), 20)}`  Step {n}/{len(self.STEPS)}")
+
+        if self._substep_line:
+            lines.append(f"`{self._bar(0, 20, 20)}`  " if False else self._substep_line)
+
+        self._write("\n".join(lines))
+
+    def _bar(self, done: int, total: int, width: int = 20) -> str:
+        if total == 0:
+            return "░" * width
+        filled = round(done / total * width)
+        return "█" * filled + "░" * (width - filled)
 
     def _write(self, text: str):
         try:
@@ -573,7 +616,7 @@ class PDFExtractor:
         "http://localhost:8070",
     ]
 
-    def __init__(self, grobid_server: str = None, extraction: str = "auto"):
+    def __init__(self, grobid_server: str = None, extraction: str = "auto", marker_mode: str = "quality"):
         if grobid_server == "local":
             self.grobid_servers = ["http://localhost:8070"]
         elif grobid_server and grobid_server != "skip":
@@ -582,22 +625,100 @@ class PDFExtractor:
             self.grobid_servers = self.PUBLIC_GROBID_SERVERS
         # extraction: "auto" | "marker" | "grobid" | "pypdf"
         self.extraction = extraction
+        self.marker_mode = marker_mode
 
-    def extract_with_marker(self, pdf_path: str) -> Optional[Tuple[str, str]]:
+    def extract_with_marker(self, pdf_path: str, progress=None) -> Optional[Tuple[str, str]]:
         """Extract text via marker (local ML pipeline). Returns (text, method)."""
         try:
             from marker.converters.pdf import PdfConverter
             from marker.models import create_model_dict
             from marker.output import text_from_rendered
             from marker.config.parser import ConfigParser
+            import tqdm as _tqdm_mod
+            import sys as _sys
 
             print(f"      Running marker (local ML extraction)...")
             import torch
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            config = ConfigParser({"output_format": "markdown", "device": device})
+            if device == "cuda":
+                try:
+                    gpu_name = torch.cuda.get_device_name(0)
+                except Exception:
+                    gpu_name = "unknown GPU"
+                print(f"      Marker device: CUDA ({gpu_name})")
+            else:
+                print("      Marker device: CPU")
+
+            orig_tqdm = _tqdm_mod.tqdm
+            patched_marker_modules = []
+
+            if progress is not None:
+                class _ProgressTqdm(orig_tqdm):
+                    def __init__(self, *args, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        self._emit_progress()
+
+                    def update(self, n=1):
+                        out = super().update(n)
+                        self._emit_progress()
+                        return out
+
+                    def refresh(self, *args, **kwargs):
+                        out = super().refresh(*args, **kwargs)
+                        self._emit_progress()
+                        return out
+
+                    def _emit_progress(self):
+                        try:
+                            total = int(self.total) if self.total else 0
+                            done = int(self.n) if self.n is not None else 0
+                            done = min(done, total) if total else done
+                            if total > 0:
+                                desc = (self.desc or "marker").strip().replace(":", "")
+                                progress.substep(1, f"marker — {desc}", done, total)
+                        except Exception:
+                            pass
+
+                _tqdm_mod.tqdm = _ProgressTqdm
+                for _mod_name, _mod in list(_sys.modules.items()):
+                    if not _mod_name:
+                        continue
+                    if not (_mod_name.startswith("marker.") or _mod_name.startswith("surya.")):
+                        continue
+                    if hasattr(_mod, "tqdm"):
+                        try:
+                            _existing_tqdm = getattr(_mod, "tqdm")
+                            if callable(_existing_tqdm):
+                                setattr(_mod, "tqdm", _ProgressTqdm)
+                                patched_marker_modules.append((_mod, _existing_tqdm))
+                        except Exception:
+                            pass
+
+            marker_cfg = {"output_format": "markdown", "device": device}
+            if self.marker_mode == "fast":
+                print("      Marker mode: FAST (ocr_without_boxes, no OCR math)")
+                # Fast mode reduces OCR overhead. Quality mode remains the default.
+                marker_cfg.update({
+                    "ocr_task_name": "ocr_without_boxes",
+                    "disable_ocr_math": True,
+                    # Slightly larger batches help throughput on CUDA when VRAM allows it.
+                    "recognition_batch_size": 96 if device == "cuda" else 32,
+                    "layout_batch_size": 12 if device == "cuda" else 4,
+                    "detection_batch_size": 8 if device == "cuda" else 4,
+                })
+
+            config = ConfigParser(marker_cfg)
             models = create_model_dict(device=device)
             converter = PdfConverter(config=config.generate_config_dict(), artifact_dict=models)
-            rendered = converter(pdf_path)
+            try:
+                rendered = converter(pdf_path)
+            finally:
+                _tqdm_mod.tqdm = orig_tqdm
+                for _mod, _old_tqdm in patched_marker_modules:
+                    try:
+                        setattr(_mod, "tqdm", _old_tqdm)
+                    except Exception:
+                        pass
             text, _, _ = text_from_rendered(rendered)
             if text and text.strip():
                 print(f"OK: Extracted with marker ({len(text):,} chars)")
@@ -611,58 +732,268 @@ class PDFExtractor:
             print(f"WARNING: marker extraction failed: {str(e)[:80]}")
             return None
 
-    def extract_with_glm_ocr(self, pdf_path: str) -> Optional[Tuple[str, str]]:
-        """Extract text via GLM-OCR running locally in Ollama. Returns (text, method)."""
+    def extract_with_glm_ocr(self, pdf_path: str, progress=None) -> Optional[Tuple[str, str]]:
+        """Extract text via GLM-OCR via Ollama REST API (urllib, no Python client).
+
+        Uses urllib per page to avoid the GGML_ASSERT crash that occurs when the
+        Python ollama client reuses state across multimodal calls.
+        """
+        import base64
+        import tempfile
+        import shutil as _sh
+        import time as _t
+        import urllib.request as _ur
+        import urllib.error as _ue
+        import concurrent.futures as _cf
+        import io as _io
+        import json as _js
+
+        if not ensure_ollama_running():
+            print("WARNING: GLM-OCR skipped — Ollama could not be started")
+            return None
+
         try:
-            import ollama
-            import fitz  # PyMuPDF
-            import base64
-            from io import BytesIO
+            import fitz
+        except ImportError:
+            print("WARNING: GLM-OCR missing dependency: pymupdf  (pip install pymupdf)")
+            return None
 
-            # Check model is available
-            models = ollama.list()
-            model_names = [m.model for m in models.models]
-            if not any("glm-ocr" in m for m in model_names):
-                print("WARNING: glm-ocr not found in Ollama. Run: ollama pull glm-ocr")
+        try:
+            with _ur.urlopen("http://localhost:11434/api/tags", timeout=5) as r:
+                tags = _js.loads(r.read())
+            if not any("glm-ocr" in m["name"] for m in tags.get("models", [])):
+                print("WARNING: glm-ocr not found. Run: ollama pull glm-ocr")
                 return None
+        except Exception as e:
+            print(f"WARNING: Cannot reach Ollama: {e}")
+            return None
 
-            print(f"      Running GLM-OCR via Ollama (page-by-page)...")
+        try:
             doc = fitz.open(pdf_path)
-            page_texts = []
+        except Exception as e:
+            print(f"WARNING: Cannot open PDF: {e}")
+            return None
 
-            for i, page in enumerate(doc):
-                # Render page to image at 150 DPI
-                mat = fitz.Matrix(150 / 72, 150 / 72)
-                pix = page.get_pixmap(matrix=mat)
-                img_bytes = pix.tobytes("jpeg")
-                img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+        print("      Running GLM-OCR via Ollama REST (page-by-page)...")
+        page_texts, failed, n = [], 0, len(doc)
+        tmp = tempfile.mkdtemp(prefix="glmocr_")
+        # GLM-OCR is sensitive to image tensor shapes. Normalize each page to a
+        # fixed 1024x1024 image before sending to Ollama.
+        target_px = 1024
+        try:
+            from PIL import Image as _PILImage
+            _pil_available = True
+        except ImportError:
+            _pil_available = False
+            print("      NOTE: Pillow not installed - using direct fitz normalization")
 
-                response = ollama.generate(
-                    model="glm-ocr",
-                    prompt="Text Recognition: ",
-                    images=[img_b64],
-                    stream=False,
+        def _restart_glm_worker(reason: str = "") -> None:
+            reason_msg = f" ({reason})" if reason else ""
+            print(f"      Restarting glm-ocr worker{reason_msg}...")
+            try:
+                subprocess.run(["ollama", "stop", "glm-ocr"], capture_output=True, text=True, timeout=10)
+            except Exception:
+                pass
+            _t.sleep(3)
+            ensure_ollama_running()
+
+        def _ocr_payload_from_bytes(img_bytes: bytes) -> bytes:
+            img_b64 = base64.b64encode(img_bytes).decode()
+            return _js.dumps({
+                "model": "glm-ocr",
+                "prompt": "Text Recognition: ",
+                "images": [img_b64],
+                "stream": False,
+                # Keep worker warm briefly to avoid repeated load/unload stalls
+                # on Windows; crash handling still restarts on bad pages.
+                "keep_alive": "30s",
+                "options": {"num_ctx": 8192},
+            }).encode()
+
+        def _ollama_generate_once(_payload: bytes) -> bytes:
+            req = _ur.Request(
+                "http://localhost:11434/api/generate",
+                data=_payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _ur.urlopen(req, timeout=180) as r:
+                return r.read()
+
+        def _run_ollama_payload(_payload: bytes, page_num: int, attempt: int, timeout_sec: int = 60) -> Tuple[str, str]:
+            """Return (text, error_message). Exactly one is non-empty."""
+            _pool = _cf.ThreadPoolExecutor(max_workers=1)
+            _future = _pool.submit(_ollama_generate_once, _payload)
+            try:
+                resp_body = _future.result(timeout=timeout_sec)
+                resp_json = _js.loads(resp_body)
+                if "error" in resp_json:
+                    return "", str(resp_json.get("error", "Unknown Ollama error"))
+                text = _strip_code_fences(resp_json.get("response", "").strip())
+                return text, ""
+            except _cf.TimeoutError:
+                _future.cancel()
+                return "", f"timed out (>{timeout_sec}s)"
+            except _ue.HTTPError as _http_exc:
+                err_raw = ""
+                err_msg = f"HTTP {_http_exc.code}"
+                try:
+                    err_raw = _http_exc.read().decode("utf-8", errors="replace")
+                    err_json = _js.loads(err_raw)
+                    err_msg = str(err_json.get("error", err_raw))[:240]
+                except Exception:
+                    if err_raw:
+                        err_msg = err_raw[:240]
+                return "", err_msg
+            except Exception as _page_exc:
+                return "", str(_page_exc)[:240]
+            finally:
+                _pool.shutdown(wait=False, cancel_futures=True)
+
+        def _is_worker_crash_error(msg: str) -> bool:
+            m = (msg or "").lower()
+            return ("health resp" in m) or ("connection refused" in m) or ("ggml_assert" in m)
+
+        def _tiled_glm_ocr(page_obj) -> str:
+            """GLM-only fallback for problematic pages: OCR 4 tiles and join output."""
+            r = page_obj.rect
+            mx = (r.x0 + r.x1) / 2.0
+            my = (r.y0 + r.y1) / 2.0
+            tiles = [
+                fitz.Rect(r.x0, r.y0, mx, my),
+                fitz.Rect(mx, r.y0, r.x1, my),
+                fitz.Rect(r.x0, my, mx, r.y1),
+                fitz.Rect(mx, my, r.x1, r.y1),
+            ]
+            tile_texts = []
+            for t_idx, t_rect in enumerate(tiles, start=1):
+                tpix = page_obj.get_pixmap(
+                    matrix=fitz.Matrix(2, 2),
+                    clip=t_rect,
+                    colorspace=fitz.csRGB,
+                    alpha=False,
                 )
-                page_text = response["response"].strip()
+                tbytes = tpix.tobytes("png")
+                if _pil_available:
+                    with _PILImage.open(_io.BytesIO(tbytes)) as _im:
+                        _im = _im.convert("RGB").resize((target_px, target_px), _PILImage.BICUBIC)
+                        _buf = _io.BytesIO()
+                        _im.save(_buf, "PNG")
+                        tbytes = _buf.getvalue()
+                t_payload = _ocr_payload_from_bytes(tbytes)
+                text, err = _run_ollama_payload(t_payload, -1, t_idx, timeout_sec=95)
+                if text:
+                    tile_texts.append(text)
+                else:
+                    print(f"      GLM tile {t_idx}/4 failed: {err}")
+                    if _is_worker_crash_error(err):
+                        _restart_glm_worker(reason=f"tile {t_idx}")
+            return "\n\n".join([t for t in tile_texts if t.strip()])
+
+        try:
+            for i, page in enumerate(doc):
+                print(f"      GLM-OCR page {i+1}/{n}: processing...")
+                # Render directly at a fixed pixel shape for stable multimodal input.
+                rect = page.rect
+                sx = target_px / max(float(rect.width), 1.0)
+                sy = target_px / max(float(rect.height), 1.0)
+                pix = page.get_pixmap(
+                    matrix=fitz.Matrix(sx, sy),
+                    colorspace=fitz.csRGB,
+                    alpha=False,
+                )
+                img_path = os.path.join(tmp, f"p{i:04d}.png")
+                pix.save(img_path)
+
+                # Keep output dimensions consistent even if renderer rounding varies.
+                if _pil_available:
+                    with _PILImage.open(img_path) as im:
+                        if im.size != (target_px, target_px):
+                            im_resized = im.resize((target_px, target_px), _PILImage.LANCZOS)
+                        else:
+                            im_resized = im
+                        im_resized.save(img_path, "PNG")
+
+                with open(img_path, "rb") as fh:
+                    img_bytes = fh.read()
+                os.unlink(img_path)
+
+                def _resized_for_attempt(_bytes: bytes, _attempt_px: int) -> bytes:
+                    if (not _pil_available) or (_attempt_px >= target_px):
+                        return _bytes
+                    try:
+                        with _PILImage.open(_io.BytesIO(_bytes)) as _im:
+                            _im = _im.convert("RGB").resize((_attempt_px, _attempt_px), _PILImage.BICUBIC)
+                            _buf = _io.BytesIO()
+                            _im.save(_buf, "PNG")
+                            return _buf.getvalue()
+                    except Exception:
+                        return _bytes
+
+                page_text = ""
+                last_err = ""
+                crash_retries = 0
+                attempt_px_schedule = [target_px, 896, 768]
+                for attempt in range(3):
+                    attempt_px = attempt_px_schedule[min(attempt, len(attempt_px_schedule) - 1)]
+                    attempt_bytes = _resized_for_attempt(img_bytes, attempt_px)
+                    payload = _ocr_payload_from_bytes(attempt_bytes)
+                    page_text, last_err = _run_ollama_payload(payload, i + 1, attempt + 1, timeout_sec=60)
+                    if page_text:
+                        break
+                    if _is_worker_crash_error(last_err):
+                        crash_retries += 1
+                    if attempt < 2:
+                        print(
+                            f"      GLM-OCR page {i+1} attempt {attempt+1} "
+                            f"(px={attempt_px}) failed: {last_err}"
+                        )
+                        if _is_worker_crash_error(last_err):
+                            _restart_glm_worker(reason=f"page {i+1} attempt {attempt+1}")
+                            # Two deterministic crash signatures usually means this page
+                            # won't recover as a full image; switch to tiled fallback early.
+                            if crash_retries >= 2:
+                                print(f"      GLM-OCR page {i+1}: repeated crash signature, switching to tiled fallback")
+                                break
+                        _t.sleep((attempt + 1) * 5)
+                    else:
+                        print(f"      GLM-OCR page {i+1} failed after 3 attempts: {last_err}")
+
+                if not page_text:
+                    print(
+                        f"      GLM-OCR page {i+1}: trying tiled fallback (GLM-only) "
+                        f"after page failure: {last_err}"
+                    )
+                    # A full-page failure often recovers when OCR is run on smaller tiles,
+                    # including timeout-heavy pages that do not surface GGML_ASSERT text.
+                    _restart_glm_worker(reason=f"before tiled page {i+1}")
+                    page_text = _tiled_glm_ocr(page)
+                    if page_text:
+                        print(f"      GLM-OCR page {i+1}: tiled fallback succeeded")
+
                 if page_text:
                     page_texts.append(page_text)
+                else:
+                    failed += 1
 
-                if (i + 1) % 10 == 0 or (i + 1) == len(doc):
-                    print(f"      GLM-OCR: {i + 1}/{len(doc)} pages done")
-
+                if progress is not None:
+                    note = f"  ({failed} failed)" if failed else ""
+                    progress.substep(1, f"GLM-OCR — page {i+1}/{n}{note}", i + 1, n)
+                if (i + 1) % 5 == 0 or (i + 1) == n:
+                    print(f"      GLM-OCR: {i+1}/{n} pages" +
+                          (f" ({failed} failed)" if failed else ""))
+        finally:
             doc.close()
-            text = "\n\n".join(page_texts)
-            if text.strip():
-                print(f"OK: Extracted with GLM-OCR ({len(text):,} chars)")
-                return text, "GLM-OCR (Ollama)"
-            print("WARNING: GLM-OCR returned empty text")
+            _sh.rmtree(tmp, ignore_errors=True)
+
+        text = "\n\n".join(page_texts)
+        if not text.strip():
+            print("WARNING: GLM-OCR returned empty on all pages")
             return None
-        except ImportError as e:
-            print(f"WARNING: GLM-OCR missing dependency: {e}")
-            return None
-        except Exception as e:
-            print(f"WARNING: GLM-OCR extraction failed: {str(e)[:80]}")
-            return None
+        if failed:
+            print(f"WARNING: GLM-OCR failed on {failed}/{n} pages — partial text")
+        print(f"OK: Extracted with GLM-OCR ({len(text):,} chars, {len(page_texts)} pages)")
+        return text, "GLM-OCR (Ollama)"
 
     def extract_with_grobid(self, pdf_path: str) -> Optional[Tuple[str, str]]:
         """Extract text via Grobid servers with fallback. Returns (text, method)."""
@@ -786,46 +1117,37 @@ class PDFExtractor:
 
         return '\n\n'.join(content_parts)
 
-    def extract_with_pypdf(self, pdf_path: str) -> Optional[Tuple[str, str]]:
-        """Extract text via PyPDF2 (fallback). Returns (text, method)."""
-        if not PyPDF2:
-            return None
-        try:
-            with open(pdf_path, 'rb') as f:
-                reader = PyPDF2.PdfReader(f)
-                text = ''
-                for page in reader.pages:
-                    text += page.extract_text() + '\n'
-            if text.strip():
-                return text, "PyPDF2"
-            return None
-        except Exception as e:
-            print(f"WARNING: PyPDF2 extraction failed: {e}")
-            return None
-
-    def extract_text(self, pdf_path: str, output_dir: Path = None) -> Tuple[str, str]:
+    def extract_text(self, pdf_path: str, output_dir: Path = None,
+                     progress=None) -> Tuple[str, str]:
         """Extract text from PDF with fallback chain. Returns (text, method_used).
 
-        Extraction order (auto): glm-ocr -> marker -> grobid -> pypdf
-        Override with --extraction glm-ocr|marker|grobid|pypdf to force a specific method.
+        Extraction order (auto): glm-ocr -> marker -> grobid
+        Override with --extraction glm-ocr|marker|grobid to force a specific method.
         """
         print(f"Extracting text from: {Path(pdf_path).name}")
 
         # Build the ordered list of methods to try
         if self.extraction == "glm-ocr":
-            methods = [self.extract_with_glm_ocr]
+            methods = [("GLM-OCR", self.extract_with_glm_ocr)]
         elif self.extraction == "marker":
-            methods = [self.extract_with_marker]
+            methods = [("marker", self.extract_with_marker)]
         elif self.extraction == "grobid":
-            methods = [self.extract_with_grobid]
-        elif self.extraction == "pypdf":
-            methods = [self.extract_with_pypdf]
+            methods = [("Grobid", self.extract_with_grobid)]
         else:
-            # auto: GLM-OCR first (fast, local, document-aware), then marker, grobid, pypdf
-            methods = [self.extract_with_glm_ocr, self.extract_with_marker, self.extract_with_grobid, self.extract_with_pypdf]
+            methods = [
+                ("GLM-OCR", self.extract_with_glm_ocr),
+                ("marker",  self.extract_with_marker),
+                ("Grobid",  self.extract_with_grobid),
+            ]
 
-        for method_fn in methods:
-            result = method_fn(pdf_path)
+        for name, method_fn in methods:
+            if progress:
+                progress.substep(1, f"Trying {name}…", 0, 1)
+            # GLM-OCR and marker can both report live extraction progress.
+            if name in ("GLM-OCR", "marker"):
+                result = method_fn(pdf_path, progress=progress)
+            else:
+                result = method_fn(pdf_path)
             if result:
                 text, method = result
                 if output_dir:
@@ -1106,6 +1428,43 @@ status: "to_listen"
 # Core processor
 # ---------------------------------------------------------------------------
 
+def ensure_ollama_running() -> bool:
+    """Start Ollama if not already running. Returns True if reachable."""
+    import urllib.request as _ur
+    import subprocess as _sp
+    import time as _t
+    import os as _os
+    try:
+        _ur.urlopen("http://localhost:11434", timeout=2)
+        return True
+    except Exception:
+        pass
+    ollama_exe = "ollama"
+    for candidate in [
+        _os.path.expandvars(r"%LOCALAPPDATA%\Programs\Ollama\ollama.exe"),
+        r"C:\Program Files\Ollama\ollama.exe",
+    ]:
+        if _os.path.exists(candidate):
+            ollama_exe = candidate
+            break
+    try:
+        _sp.Popen(
+            [ollama_exe, "serve"],
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+        )
+        for _ in range(10):
+            _t.sleep(1)
+            try:
+                _ur.urlopen("http://localhost:11434", timeout=1)
+                return True
+            except Exception:
+                pass
+    except FileNotFoundError:
+        print("WARNING: ollama not found. Install from https://ollama.ai")
+    return False
+
+
 def process_pdf(
     pdf_path: Path,
     output_audio_dir: Path,
@@ -1115,22 +1474,33 @@ def process_pdf(
     tts_method: str = "edge-tts",
     grobid_server: str = None,
     extraction: str = "auto",
+    marker_mode: str = "quality",
+    batch_index: int = 0,
+    batch_total: int = 1,
+    completed_log: list = None,
 ) -> bool:
     """Process a single PDF file."""
 
     import time
     start_time = time.time()
-    progress = Progress(vault, pdf_path.name)
+    progress = Progress(vault, pdf_path.name,
+                    batch_index=batch_index,
+                    batch_total=batch_total,
+                    completed_log=completed_log)
 
     print(f"Processing: {pdf_path.name}")
 
     # 1. Extract text
     progress.step(1)
     print(f"[1/4] Extracting text from PDF...")
-    extractor = PDFExtractor(grobid_server=grobid_server, extraction=extraction)
+    extractor = PDFExtractor(
+        grobid_server=grobid_server,
+        extraction=extraction,
+        marker_mode=marker_mode,
+    )
     try:
         extracted_text, extraction_method = extractor.extract_text(
-            str(pdf_path), output_extracted_dir
+            str(pdf_path), output_extracted_dir, progress=progress
         )
         elapsed = time.time() - start_time
         print(f"      OK: Extraction complete ({elapsed:.1f}s) - {extraction_method}")
@@ -1238,9 +1608,12 @@ Examples:
     parser.add_argument("--tts",   choices=["edge-tts", "coqui"], default="edge-tts")
     parser.add_argument("--grobid", default=None,
                         help="Grobid server URL, 'local', or 'skip'")
-    parser.add_argument("--extraction", choices=["auto", "glm-ocr", "marker", "grobid", "pypdf"],
+    parser.add_argument("--all", action="store_true", help="Convert all PDFs in pdfs_to_convert/")
+    parser.add_argument("--extraction", choices=["auto", "glm-ocr", "marker", "grobid"],
                         default="auto",
-                        help="Extraction method: auto (glm-ocr->marker->grobid->pypdf), glm-ocr, marker, grobid, or pypdf")
+                        help="Extraction method: auto (glm-ocr->marker->grobid), glm-ocr, marker, or grobid")
+    parser.add_argument("--marker-mode", choices=["quality", "fast"], default="quality",
+                        help="Marker mode when using marker extraction: quality (default) or fast")
     parser.add_argument("--pdf",   type=str, default=None,
                         help="PDF filename (just the name, not full path) or full path")
 
@@ -1257,59 +1630,88 @@ Examples:
     output_audio_dir.mkdir(exist_ok=True)
     output_extracted_dir.mkdir(exist_ok=True)
 
-    # Determine which PDF to process
-    if args.pdf:
+    home_note_path = args.note.rstrip(" )")
+
+    # Collect PDF list
+    if getattr(args, "all", False):
+        pdf_files = sorted(input_dir.glob("*.pdf"))
+        if not pdf_files:
+            print("INFO: No PDFs found in pdfs_to_convert/")
+            return 0
+        print(f"Batch mode: {len(pdf_files)} PDF(s) queued.")
+        pending_file.write_text("", encoding="utf-8")
+    elif args.pdf:
         pdf_arg = Path(args.pdf)
-        pdf_path = pdf_arg if pdf_arg.is_absolute() else input_dir / pdf_arg
+        pdf_files = [pdf_arg if pdf_arg.is_absolute() else input_dir / pdf_arg]
     elif pending_file.exists():
         pdf_name = pending_file.read_text(encoding="utf-8").strip()
         if not pdf_name:
-            print("FAILED: pdf_to_convert_pending.txt is empty. Select a PDF and try again.")
+            print("FAILED: pdf_to_convert_pending.txt is empty.")
             return 1
-        pdf_path = input_dir / pdf_name
-        # Clear the pending file
+        pdf_files = [input_dir / pdf_name]
         pending_file.write_text("", encoding="utf-8")
     else:
-        # Fallback: process all PDFs in input_dir
-        pdf_files = list(input_dir.glob("*.pdf"))
-        if not pdf_files:
-            print(f"INFO: No PDFs found in: {input_dir}")
-            print("Place PDF files in the 'pdfs_to_convert' folder to begin.")
-            return 0
-        pdf_path = pdf_files[0]
-        print(f"No PDF specified; using first found: {pdf_path.name}")
-
-    if not pdf_path.exists():
-        print(f"FAILED: PDF not found: {pdf_path}")
+        print("FAILED: No PDF specified and pdf_to_convert_pending.txt is empty.")
         return 1
 
+    import time as _bt
+    archive_dir = input_dir / "_processed"
+    archive_dir.mkdir(exist_ok=True)
+    results, completed_log = [], []
     today = datetime.now().strftime("%Y-%m-%d")
 
-    success = process_pdf(
-        pdf_path=pdf_path,
-        output_audio_dir=output_audio_dir,
-        output_notes_dir=output_notes_dir,
-        output_extracted_dir=output_extracted_dir,
-        vault=vault,
-        tts_method=args.tts,
-        grobid_server=args.grobid,
-        extraction=args.extraction,
-    )
+    for idx, pdf_path in enumerate(pdf_files):
+        if not pdf_path.exists():
+            print(f"SKIPPED: {pdf_path.name} not found")
+            results.append((pdf_path.name, False))
+            completed_log.append((pdf_path.name, 0, False))
+            continue
+        if len(pdf_files) > 1:
+            print(f"\n{'='*60}\nPDF {idx+1}/{len(pdf_files)}: {pdf_path.name}\n{'='*60}")
+        t0 = _bt.time()
+        success = process_pdf(
+            pdf_path=pdf_path,
+            output_audio_dir=output_audio_dir,
+            output_notes_dir=output_notes_dir,
+            output_extracted_dir=output_extracted_dir,
+            vault=vault,
+            tts_method=args.tts,
+            grobid_server=args.grobid,
+            extraction=args.extraction,
+            marker_mode=args.marker_mode,
+            batch_index=idx,
+            batch_total=len(pdf_files),
+            completed_log=completed_log,
+        )
+        elapsed = _bt.time() - t0
+        if success:
+            add_listen_task(home_note_path, pdf_path.stem, today)
+            dest = archive_dir / pdf_path.name
+            if dest.exists():
+                dest.unlink()
+            pdf_path.rename(dest)
+            print(f"OK: PDF archived to: _processed/{pdf_path.name}")
+        results.append((pdf_path.name, success))
+        completed_log.append((pdf_path.name, elapsed, success))
 
-    if success:
-        # Add Listen task to home note
-        add_listen_task(args.note, pdf_path.stem, today)
+    n_ok = sum(s for _, s in results)
+    if len(results) > 1:
+        print(f"\n{'='*60}\nBATCH COMPLETE: {n_ok}/{len(results)} succeeded")
+        for name, ok in results:
+            print(f"  {'OK' if ok else 'FAILED':6s}  {name}")
+        print(f"{'='*60}")
+        prog_path = vault / "99 - System" / "pdf_convert_progress.md"
+        lines_out = [f"### Batch complete: {n_ok}/{len(results)} succeeded", ""]
+        total_e = sum(e for _, e, _ in completed_log)
+        for name, elapsed, ok in completed_log:
+            lines_out.append(f"{'OK' if ok else 'FAILED'}  {name}  ({elapsed:.0f}s)")
+        lines_out += ["", f"Total time: {total_e:.0f}s"]
+        try:
+            prog_path.write_text("\n".join(lines_out) + "\n", encoding="utf-8")
+        except Exception:
+            pass
 
-        # Archive the processed PDF
-        archive_dir = input_dir / "_processed"
-        archive_dir.mkdir(exist_ok=True)
-        dest = archive_dir / pdf_path.name
-        if dest.exists():
-            dest.unlink()
-        pdf_path.rename(dest)
-        print(f"OK: PDF archived to: _processed/{pdf_path.name}")
-
-    return 0 if success else 1
+    return 0 if all(s for _, s in results) else 1
 
 
 if __name__ == "__main__":
