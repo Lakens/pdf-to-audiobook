@@ -25,6 +25,8 @@ from datetime import datetime
 from typing import Optional, Tuple
 import subprocess
 
+SCRIPT_VERSION = "0.1.0"
+
 # Try to import optional dependencies
 try:
     import requests
@@ -775,7 +777,7 @@ class PDFExtractor:
             return None
 
         print("      Running GLM-OCR via Ollama REST (page-by-page)...")
-        page_texts, failed, n = [], 0, len(doc)
+        page_texts, failed, skipped_empty, n = [], 0, 0, len(doc)
         tmp = tempfile.mkdtemp(prefix="glmocr_")
         # GLM-OCR is sensitive to image tensor shapes. Normalize each page to a
         # fixed 1024x1024 image before sending to Ollama.
@@ -845,14 +847,30 @@ class PDFExtractor:
                     if err_raw:
                         err_msg = err_raw[:240]
                 return "", err_msg
+            except _ue.URLError as _url_exc:
+                return "", f"URL error: {_url_exc.reason}"
             except Exception as _page_exc:
-                return "", str(_page_exc)[:240]
+                err = str(_page_exc).strip() or repr(_page_exc)
+                return "", err[:240]
             finally:
                 _pool.shutdown(wait=False, cancel_futures=True)
 
         def _is_worker_crash_error(msg: str) -> bool:
             m = (msg or "").lower()
             return ("health resp" in m) or ("connection refused" in m) or ("ggml_assert" in m)
+
+        def _is_likely_empty_page(page_obj) -> bool:
+            """Disabled to avoid false skips; keep all pages in OCR pipeline."""
+            return False
+
+        def _issue_note() -> str:
+            if failed and skipped_empty:
+                return f"  ({failed} failed, {skipped_empty} empty skipped)"
+            if failed:
+                return f"  ({failed} failed)"
+            if skipped_empty:
+                return f"  ({skipped_empty} empty skipped)"
+            return ""
 
         def _tiled_glm_ocr(page_obj) -> str:
             """GLM-only fallback for problematic pages: OCR 4 tiles and join output."""
@@ -881,18 +899,33 @@ class PDFExtractor:
                         _im.save(_buf, "PNG")
                         tbytes = _buf.getvalue()
                 t_payload = _ocr_payload_from_bytes(tbytes)
-                text, err = _run_ollama_payload(t_payload, -1, t_idx, timeout_sec=95)
+                text = ""
+                err = ""
+                for tile_attempt in range(2):
+                    text, err = _run_ollama_payload(t_payload, -1, t_idx, timeout_sec=95)
+                    if text:
+                        break
+                    err_disp = err or "<no error message>"
+                    print(f"      GLM tile {t_idx}/4 attempt {tile_attempt + 1} failed: {err_disp}")
+                    if _is_worker_crash_error(err):
+                        _restart_glm_worker(reason=f"tile {t_idx} attempt {tile_attempt + 1}")
                 if text:
                     tile_texts.append(text)
-                else:
-                    print(f"      GLM tile {t_idx}/4 failed: {err}")
-                    if _is_worker_crash_error(err):
-                        _restart_glm_worker(reason=f"tile {t_idx}")
             return "\n\n".join([t for t in tile_texts if t.strip()])
 
         try:
             for i, page in enumerate(doc):
                 print(f"      GLM-OCR page {i+1}/{n}: processing...")
+
+                if _is_likely_empty_page(page):
+                    skipped_empty += 1
+                    print(f"      GLM-OCR page {i+1}: skipped likely-empty page")
+                    if progress is not None:
+                        progress.substep(1, f"GLM-OCR — page {i+1}/{n}{_issue_note()}", i + 1, n)
+                    if (i + 1) % 5 == 0 or (i + 1) == n:
+                        print(f"      GLM-OCR: {i+1}/{n} pages" + _issue_note())
+                    continue
+
                 # Render directly at a fixed pixel shape for stable multimodal input.
                 rect = page.rect
                 sx = target_px / max(float(rect.width), 1.0)
@@ -944,9 +977,10 @@ class PDFExtractor:
                     if _is_worker_crash_error(last_err):
                         crash_retries += 1
                     if attempt < 2:
+                        err_disp = last_err or "<no error message>"
                         print(
                             f"      GLM-OCR page {i+1} attempt {attempt+1} "
-                            f"(px={attempt_px}) failed: {last_err}"
+                            f"(px={attempt_px}) failed: {err_disp}"
                         )
                         if _is_worker_crash_error(last_err):
                             _restart_glm_worker(reason=f"page {i+1} attempt {attempt+1}")
@@ -957,12 +991,14 @@ class PDFExtractor:
                                 break
                         _t.sleep((attempt + 1) * 5)
                     else:
-                        print(f"      GLM-OCR page {i+1} failed after 3 attempts: {last_err}")
+                        err_disp = last_err or "<no error message>"
+                        print(f"      GLM-OCR page {i+1} failed after 3 attempts: {err_disp}")
 
                 if not page_text:
+                    err_disp = last_err or "<no error message>"
                     print(
                         f"      GLM-OCR page {i+1}: trying tiled fallback (GLM-only) "
-                        f"after page failure: {last_err}"
+                        f"after page failure: {err_disp}"
                     )
                     # A full-page failure often recovers when OCR is run on smaller tiles,
                     # including timeout-heavy pages that do not surface GGML_ASSERT text.
@@ -971,17 +1007,22 @@ class PDFExtractor:
                     if page_text:
                         print(f"      GLM-OCR page {i+1}: tiled fallback succeeded")
 
+                if not page_text:
+                    # Final fallback: extract embedded PDF text for this page only.
+                    fallback_text = (page.get_text("text") or "").strip()
+                    if fallback_text:
+                        page_text = fallback_text
+                        print(f"      GLM-OCR page {i+1}: used embedded-text fallback")
+
                 if page_text:
                     page_texts.append(page_text)
                 else:
                     failed += 1
 
                 if progress is not None:
-                    note = f"  ({failed} failed)" if failed else ""
-                    progress.substep(1, f"GLM-OCR — page {i+1}/{n}{note}", i + 1, n)
+                    progress.substep(1, f"GLM-OCR — page {i+1}/{n}{_issue_note()}", i + 1, n)
                 if (i + 1) % 5 == 0 or (i + 1) == n:
-                    print(f"      GLM-OCR: {i+1}/{n} pages" +
-                          (f" ({failed} failed)" if failed else ""))
+                    print(f"      GLM-OCR: {i+1}/{n} pages" + _issue_note())
         finally:
             doc.close()
             _sh.rmtree(tmp, ignore_errors=True)
@@ -990,8 +1031,13 @@ class PDFExtractor:
         if not text.strip():
             print("WARNING: GLM-OCR returned empty on all pages")
             return None
-        if failed:
-            print(f"WARNING: GLM-OCR failed on {failed}/{n} pages — partial text")
+        if failed or skipped_empty:
+            issues = []
+            if failed:
+                issues.append(f"{failed} failed")
+            if skipped_empty:
+                issues.append(f"{skipped_empty} empty skipped")
+            print(f"WARNING: GLM-OCR page outcomes: {', '.join(issues)} out of {n}")
         print(f"OK: Extracted with GLM-OCR ({len(text):,} chars, {len(page_texts)} pages)")
         return text, "GLM-OCR (Ollama)"
 
@@ -1217,8 +1263,13 @@ class UnifiedSpeechAPI:
             async def tts_chunk_async(chunk_text, chunk_path):
                 boundaries = []
                 communicate = Communicate(text=chunk_text, voice=voice, rate="+20%")
+                stream_iter = communicate.stream() if hasattr(communicate, "stream") else communicate
+                if not hasattr(stream_iter, "__aiter__"):
+                    raise TypeError(
+                        "edge-tts stream object is not async iterable; please update edge-tts"
+                    )
                 with open(chunk_path, "wb") as audio_file:
-                    async for item in communicate.stream():
+                    async for item in stream_iter:
                         if item["type"] == "audio":
                             audio_file.write(item["data"])
                         elif item["type"] in ("WordBoundary", "SentenceBoundary"):
@@ -1606,6 +1657,7 @@ Examples:
     parser.add_argument("--vault", required=True, help="Absolute path to Obsidian vault root")
     parser.add_argument("--note",  required=True, help="Absolute path to home note")
     parser.add_argument("--tts",   choices=["edge-tts", "coqui"], default="edge-tts")
+    parser.add_argument("--version", action="version", version=f"pdf_to_speech.py v{SCRIPT_VERSION}")
     parser.add_argument("--grobid", default=None,
                         help="Grobid server URL, 'local', or 'skip'")
     parser.add_argument("--all", action="store_true", help="Convert all PDFs in pdfs_to_convert/")
@@ -1648,7 +1700,15 @@ Examples:
         if not pdf_name:
             print("FAILED: pdf_to_convert_pending.txt is empty.")
             return 1
-        pdf_files = [input_dir / pdf_name]
+        if pdf_name == "__ALL__":
+            pdf_files = sorted(input_dir.glob("*.pdf"))
+            if not pdf_files:
+                print("INFO: No PDFs found in pdfs_to_convert/")
+                pending_file.write_text("", encoding="utf-8")
+                return 0
+            print(f"Batch mode (pending token): {len(pdf_files)} PDF(s) queued.")
+        else:
+            pdf_files = [input_dir / pdf_name]
         pending_file.write_text("", encoding="utf-8")
     else:
         print("FAILED: No PDF specified and pdf_to_convert_pending.txt is empty.")
@@ -1687,10 +1747,22 @@ Examples:
         if success:
             add_listen_task(home_note_path, pdf_path.stem, today)
             dest = archive_dir / pdf_path.name
-            if dest.exists():
-                dest.unlink()
-            pdf_path.rename(dest)
-            print(f"OK: PDF archived to: _processed/{pdf_path.name}")
+            try:
+                if dest.exists():
+                    dest.unlink()
+                if pdf_path.exists():
+                    pdf_path.rename(dest)
+                    print(f"OK: PDF archived to: _processed/{pdf_path.name}")
+                else:
+                    print(
+                        f"WARNING: Source PDF missing before archive step: {pdf_path.name} "
+                        f"(conversion already completed)"
+                    )
+            except OSError as e:
+                print(
+                    f"WARNING: Could not archive PDF {pdf_path.name}: {e} "
+                    f"(conversion already completed)"
+                )
         results.append((pdf_path.name, success))
         completed_log.append((pdf_path.name, elapsed, success))
 

@@ -1,5 +1,31 @@
 # PDF to Speech Converter - Setup Guide
 
+## Versioning
+
+- Script version source: `SCRIPT_VERSION` in `pdf_to_speech.py`
+- CLI version check: `python pdf_to_speech.py --version`
+- Version style: semantic versioning (`MAJOR.MINOR.PATCH`)
+
+## Version Updates
+
+### v0.1.0 (2026-05-04)
+
+- Added explicit script versioning (`SCRIPT_VERSION`) and a `--version` CLI flag.
+- Improved Edge TTS compatibility across `edge-tts` iterator variants.
+- Improved GLM-OCR diagnostics so blank exceptions are reported as `<no error message>`.
+- Added GLM per-tile retry handling for tiled fallback OCR.
+- Added GLM per-page embedded-text fallback when OCR fails.
+- Made archive/move step non-fatal so successful conversions do not crash batch processing.
+- Updated status wording to avoid overclaiming causes (`failed` vs uncertainty about empty pages).
+
+## Lessons Learned
+
+- Treat post-processing as best-effort: conversion success and archiving are separate outcomes.
+- OCR engines can fail silently; logs should normalize empty exception text so failures are debuggable.
+- Fallback chains should degrade gracefully and keep the batch running.
+- Empty-page detection without image inspection is not reliable enough for automatic skipping.
+- Large-batch pipelines need non-fatal error handling at every stage to prevent losing completed work.
+
 ## Quick Start
 
 ### 1. Install Dependencies
